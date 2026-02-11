@@ -1,0 +1,81 @@
+[package]
+name = "ldk-lsp"
+version = "0.1.0"
+edition = "2021"
+authors = ["Your Name <your.email@example.com>"]
+description = "A flexible Lightning Service Provider built on LDK Server"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/yourusername/ldk-lsp"
+
+[dependencies]
+# LDK Server dependencies (from local path for development)
+ldk-server-protos = { path = "../ldk-server/ldk-server-protos" }
+ldk-server-client = { path = "../ldk-server/ldk-server-client" }
+
+# LDK Node for running the Lightning node
+ldk-node = "0.7"
+
+# Core LDK dependencies
+lightning = { version = "0.2.2", features = ["std"] }
+lightning-invoice = { version = "0.32.0" }
+
+# Bitcoin dependencies
+bitcoin = { version = "0.32.0", features = ["std", "rand-std"] }
+
+# gRPC and protobuf (for communicating with ldk-server)
+tonic = { version = "0.12", features = ["tls"] }
+prost = "0.11"
+
+# Async runtime
+tokio = { version = "1.35", features = ["full"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+tokio-stream = "0.1"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+
+# Logging and errors
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+anyhow = "1.0"
+thiserror = "1.0"
+
+# HTTP API (for LSP services)
+axum = { version = "0.7", features = ["macros"] }
+tower = "0.4"
+tower-http = { version = "0.5", features = ["cors", "trace"] }
+
+# Database - use rusqlite to match ldk-node 0.7's dependency
+rusqlite = { version = "0.31", features = ["bundled", "chrono", "uuid"] }
+
+# Utilities
+hex = "0.4"
+rand = "0.8"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1.6", features = ["v4", "serde"] }
+dirs = "5.0"
+
+# RabbitMQ for async event notifications
+lapin = "2.5"
+futures = "0.3"
+
+[dev-dependencies]
+tokio-test = "0.4"
+mockall = "0.12"
+
+[[bin]]
+name = "ldk-lsp"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+
+# Ensure we use the same versions as ldk-server
+[patch.crates-io]
+# Pin lightning versions to match ldk-server
+lightning = { git = "https://github.com/lightningdevkit/rust-lightning.git", tag = "v0.0.123" }

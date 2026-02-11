@@ -1,0 +1,73 @@
+# Example LDK-LSP Configuration
+
+# Node identity settings
+[node]
+alias = "My LSP Node"
+network = "regtest"  # Options: mainnet, testnet, signet, regtest
+# Data directory for LSP data (relative paths resolved from working directory)
+data_dir = "./ldk-lsp"
+
+# LDK Server connection
+[ldk_server]
+host = "127.0.0.1"
+port = 3009
+tls_certificate = "/path/to/tls/cert.pem"  # Optional: for TLS connections
+# Either specify the API key directly:
+# auth_token = "your-api-key"
+# Or read it from the file ldk-server generated:
+api_key_file = "/path/to/ldk-server/data/api_key"  # Optional: read API key from file
+timeout_seconds = 30
+
+# RabbitMQ configuration for async event notifications
+# This allows ldk-lsp to receive real-time notifications when payments are received
+# instead of polling. Must match ldk-server's RabbitMQ configuration.
+[ldk_server.rabbitmq]
+# Connection string format: amqp://user:password@host:port/vhost
+# Note: The default vhost "/" must be URL-encoded as "%2F"
+connection_string = "amqp://guest:guest@localhost:5672/%2F"
+exchange_name = "ldk-server"
+# Optional: specific queue name (auto-generated if not set)
+# queue_name = "ldk-lsp-instance-1"
+
+# LSP service settings
+[lsp]
+# Fee structure
+channel_open_base_fee = 10000        # Base fee in satoshis (10k sats)
+channel_open_fee_ppm = 10000         # Fee rate in parts per million (1% = 10000)
+
+# Channel size limits
+min_channel_size = 100000            # Minimum channel size: 100k sats
+max_channel_size = 100000000         # Maximum channel size: 1 BTC
+
+# Feature toggles
+enable_zeroconf = true
+enable_splicing = true
+
+# Zeroconf settings
+zeroconf_min_size = 50000            # Minimum size for zeroconf: 50k sats
+max_pending_zeroconf = 5             # Max pending zeroconf channels per peer
+
+# Confirmation target for channel opens
+confirmation_target = 6
+
+# API server settings
+[api]
+bind_address = "0.0.0.0:8080"
+timeout_seconds = 30
+enable_cors = true
+rate_limit_per_minute = 60
+
+# Database settings
+[database]
+# Database URL - can be absolute or relative to data_dir
+# Examples:
+#   - "sqlite:ldk-lsp.db" (relative to data_dir)
+#   - "sqlite:/var/lib/ldk-lsp/ldk-lsp.db" (absolute path)
+#   - "sqlite::memory:" (in-memory, for testing only)
+url = "sqlite:ldk-lsp.db"
+max_connections = 10
+
+# Logging settings
+[logging]
+level = "info"      # Options: trace, debug, info, warn, error
+format = "pretty"   # Options: pretty, compact, json

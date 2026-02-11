@@ -1,0 +1,14 @@
+services:
+  rabbitmq:
+#    image: registry.getalbypro.com/bitnamilegacy/rabbitmq:3.11.4-debian-11-r0
+    image: rabbitmq:4.2.3-management-alpine
+    container_name: 'rabbitmq'
+    ports:
+      - "5672:5672"  # AMQP port for the relay
+      - "15672:15672" # Management UI port
+    volumes:
+      - ~/.docker-conf/rabbitmq/data/:/var/lib/rabbitmq/
+      - ~/.docker-conf/rabbitmq/log/:/var/log/rabbitmq
+    environment:
+      - RABBITMQ_DEFAULT_USER=guest # Default user, fine for local dev
+      - RABBITMQ_DEFAULT_PASS=guest # Default pass, fine for local dev

@@ -1,0 +1,58 @@
+# Example LDK-LSP Configuration
+
+# Node identity settings
+[node]
+alias = "Alby LSP"
+network = "mainnet"  # Options: mainnet, testnet, signet, regtest
+data_dir = "data"
+
+# LDK Server connection
+[ldk_server]
+host = "127.0.0.1"
+port = 10009
+tls_certificate = "/home/fmar/.ldk-server/tls.crt"  # Optional: for TLS connections
+#auth_token = "your-auth-token"  # Optional: if ldk-server requires auth
+api_key_file = "/home/fmar/.ldk-server/bitcoin/api_key"  # Optional: if ldk-server uses API keys
+timeout_seconds = 30
+
+[ldk_server.rabbitmq]
+connection_string = "amqp://guest:guest@localhost:5672/%2F"
+exchange_name = "ldk-server"
+
+# LSP service settings
+[lsp]
+# Fee structure
+channel_open_base_fee = 100        # Base fee in satoshis (10k sats)
+channel_open_fee_ppm = 1000         # Fee rate in parts per million (1% = 10000)
+
+# Channel size limits
+min_channel_size = 1000            # Minimum channel size: 100k sats
+max_channel_size = 100000000         # Maximum channel size: 1 BTC
+
+# Feature toggles
+enable_zeroconf = true
+enable_splicing = true
+
+# Zeroconf settings
+zeroconf_min_size = 2000            # Minimum size for zeroconf: 50k sats
+max_pending_zeroconf = 1             # Max pending zeroconf channels per peer
+
+# Confirmation target for channel opens
+confirmation_target = 6
+
+# API server settings
+[api]
+bind_address = "0.0.0.0:18080"
+timeout_seconds = 30
+enable_cors = true
+rate_limit_per_minute = 60
+
+# Database settings
+[database]
+url = "sqlite:ldk-lsp.db"
+max_connections = 10
+
+# Logging settings
+[logging]
+level = "info"      # Options: trace, debug, info, warn, error
+format = "pretty"   # Options: pretty, compact, json
