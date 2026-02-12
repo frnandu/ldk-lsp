@@ -1,10 +1,8 @@
 //! Database module for LDK-LSP
 //!
 //! This module handles persistent storage for:
-//! - Channel requests
-//! - Payment records
-//! - Splice operations
-//! - User/peer data
+//! - JIT Receive requests (inbound liquidity)
+//! - Peer tracking
 
 use rusqlite::{Connection, Result as SqliteResult};
 use std::path::Path;
@@ -61,93 +59,7 @@ impl Database {
     fn run_migrations(conn: &Connection) -> anyhow::Result<()> {
         debug!("Running database migrations...");
 
-        // Create tables if they don't exist
-        conn.execute(
-            r#"
-            CREATE TABLE IF NOT EXISTS channel_requests (
-                id TEXT PRIMARY KEY,
-                node_id TEXT NOT NULL,
-                host TEXT NOT NULL,
-                port INTEGER NOT NULL,
-                capacity INTEGER NOT NULL,
-                fee INTEGER NOT NULL,
-                require_zeroconf BOOLEAN NOT NULL DEFAULT 0,
-                status TEXT NOT NULL,
-                channel_id TEXT,
-                payment_hash TEXT,
-                failure_reason TEXT,
-                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
-            )
-            "#,
-            [],
-        )?;
-
-        // Migration: Add failure_reason column if it doesn't exist (for existing databases)
-        let column_exists: bool = conn.query_row(
-            "SELECT COUNT(*) FROM pragma_table_info('channel_requests') WHERE name = 'failure_reason'",
-            [],
-            |row| row.get(0),
-        ).unwrap_or(0) > 0;
-        
-        if !column_exists {
-            debug!("Adding failure_reason column to channel_requests table...");
-            conn.execute(
-                "ALTER TABLE channel_requests ADD COLUMN failure_reason TEXT",
-                [],
-            )?;
-        }
-
-        conn.execute(
-            r#"
-            CREATE TABLE IF NOT EXISTS payments (
-                id TEXT PRIMARY KEY,
-                payment_hash TEXT UNIQUE NOT NULL,
-                request_id TEXT,
-                amount_msat INTEGER NOT NULL,
-                status TEXT NOT NULL,
-                preimage TEXT,
-                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                settled_at DATETIME,
-                FOREIGN KEY (request_id) REFERENCES channel_requests(id)
-            )
-            "#,
-            [],
-        )?;
-
-        conn.execute(
-            r#"
-            CREATE TABLE IF NOT EXISTS splice_requests (
-                id TEXT PRIMARY KEY,
-                channel_id TEXT NOT NULL,
-                operation_type TEXT NOT NULL,
-                amount INTEGER NOT NULL,
-                address TEXT,
-                status TEXT NOT NULL,
-                txid TEXT,
-                payment_hash TEXT,
-                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
-            )
-            "#,
-            [],
-        )?;
-
-        // Migration: Add payment_hash column if it doesn't exist (for existing databases)
-        let splice_column_exists: bool = conn.query_row(
-            "SELECT COUNT(*) FROM pragma_table_info('splice_requests') WHERE name = 'payment_hash'",
-            [],
-            |row| row.get(0),
-        ).unwrap_or(0) > 0;
-
-        if !splice_column_exists {
-            debug!("Adding payment_hash column to splice_requests table...");
-            conn.execute(
-                "ALTER TABLE splice_requests ADD COLUMN payment_hash TEXT",
-                [],
-            )?;
-        }
-
+        // Create peers table for tracking node information
         conn.execute(
             r#"
             CREATE TABLE IF NOT EXISTS peers (
@@ -163,24 +75,72 @@ impl Database {
             [],
         )?;
 
-        // Create indexes
+        // Check if receive_requests table exists and needs to be recreated
+        let table_exists: bool = conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='receive_requests'",
+            [],
+            |row| row.get(0),
+        ).unwrap_or(0) > 0;
+
+        if table_exists {
+            // Check if required columns exist
+            let required_columns = ["total_channel_capacity", "fee_rate"];
+            for col in &required_columns {
+                let column_exists: bool = conn.query_row(
+                    &format!("SELECT COUNT(*) FROM pragma_table_info('receive_requests') WHERE name='{}'", col),
+                    [],
+                    |row| row.get(0),
+                ).unwrap_or(0) > 0;
+
+                if !column_exists {
+                    info!("Dropping old receive_requests table to add {} column...", col);
+                    conn.execute("DROP TABLE receive_requests", [])?;
+                    break;
+                }
+            }
+        }
+
+        // Create receive_requests table for JIT liquidity
         conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_channel_requests_node_id ON channel_requests(node_id)",
+            r#"
+            CREATE TABLE IF NOT EXISTS receive_requests (
+                id TEXT PRIMARY KEY,
+                node_id TEXT NOT NULL,
+                host TEXT NOT NULL,
+                port INTEGER NOT NULL,
+                amount INTEGER NOT NULL,
+                fee_base INTEGER NOT NULL,
+                fee_ppm INTEGER NOT NULL,
+                fee_onchain INTEGER NOT NULL,
+                fee_total INTEGER NOT NULL,
+                fee_rate INTEGER NOT NULL,
+                total_invoice_amount INTEGER NOT NULL,
+                total_channel_capacity INTEGER NOT NULL,
+                is_splice BOOLEAN NOT NULL DEFAULT 0,
+                channel_id TEXT,
+                status TEXT NOT NULL,
+                payment_hash TEXT,
+                failure_reason TEXT,
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            "#,
+            [],
+        )?;
+
+        // Create indexes for receive_requests
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_receive_node_id ON receive_requests(node_id)",
             [],
         )?;
 
         conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_channel_requests_status ON channel_requests(status)",
+            "CREATE INDEX IF NOT EXISTS idx_receive_status ON receive_requests(status)",
             [],
         )?;
 
         conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_payments_hash ON payments(payment_hash)",
-            [],
-        )?;
-
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_splice_channel_id ON splice_requests(channel_id)",
+            "CREATE INDEX IF NOT EXISTS idx_receive_payment_hash ON receive_requests(payment_hash)",
             [],
         )?;
 

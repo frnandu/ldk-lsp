@@ -169,6 +169,32 @@ impl NodeClient {
         Ok(())
     }
 
+    /// Splice in funds to increase channel capacity
+    pub async fn splice_in(
+        &self,
+        user_channel_id: &str,
+        counterparty_node_id: &str,
+        splice_amount_sats: u64,
+    ) -> LspResult<()> {
+        info!(
+            "Splicing in: user_channel_id={}, counterparty_node_id={}, amount={} sats",
+            user_channel_id, counterparty_node_id, splice_amount_sats
+        );
+
+        let request = ldk_server_protos::api::SpliceInRequest {
+            user_channel_id: user_channel_id.to_string(),
+            counterparty_node_id: counterparty_node_id.to_string(),
+            splice_amount_sats,
+        };
+
+        self.client.splice_in(request).await
+            .map_err(map_client_error)?;
+
+        info!("Splice in initiated: user_channel_id={}", user_channel_id);
+
+        Ok(())
+    }
+
     /// List all channels
     pub async fn list_channels(&self) -> LspResult<Vec<ChannelInfo>> {
         debug!("Listing channels");
@@ -198,6 +224,24 @@ impl NodeClient {
         }).collect();
 
         Ok(channels)
+    }
+
+    /// Get channels by counterparty node ID
+    pub async fn get_channels_by_node_id(&self, node_id: &str) -> LspResult<Vec<ChannelInfo>> {
+        debug!("Getting channels for node_id: {}", node_id);
+
+        let all_channels = self.list_channels().await?;
+        let filtered: Vec<ChannelInfo> = all_channels
+            .into_iter()
+            .filter(|c| c.counterparty_node_id == node_id)
+            .collect();
+
+        debug!(
+            "Found {} channels for node_id: {}",
+            filtered.len(),
+            node_id
+        );
+        Ok(filtered)
     }
 
     /// Create a new invoice using ldk-server's bolt11_receive endpoint

@@ -1,40 +1,54 @@
 # LDK-LSP
 
-A flexible Lightning Service Provider (LSP) built on top of [LDK Server](https://github.com/lightningdevkit/ldk-server).
+A flexible Lightning Service Provider (LSP) built on top of [LDK Server](https://github.com/lightningdevkit/ldk-server). Provides Just-In-Time (JIT) liquidity for users lacking inbound channel capacity.
 
 ## Features
 
-- **Zero-confirmation (zeroconf) channel opens**: Allow clients to receive payments immediately without waiting for on-chain confirmations
-- **Channel splicing**: Increase or decrease channel capacity without closing and reopening channels
-- **HTTP API**: RESTful API for channel purchases and management
-- **Webhook support**: Payment notifications for automated channel opening
+- **JIT Receive (Just-In-Time Liquidity)**: Users without inbound capacity can request a quote, pay an invoice, and automatically receive either:
+  - A new channel opened to them (with zero-conf)
+  - A splice-in to an existing channel
+- **Dynamic Fee Estimation**: Real-time onchain fee rates fetched from your configured Esplora instance
+- **Inbound Buffer**: Channels are opened with extra capacity beyond what the user paid for, giving them spare inbound liquidity
+- **Zero-confirmation (zeroconf)**: New channels are usable immediately
+- **HTTP API**: RESTful API for JIT receive requests
+- **RabbitMQ Events**: Async payment notifications trigger automatic channel opens/splices
 
 ## Architecture
 
 ```
 ┌─────────────┐     HTTP API      ┌──────────────┐
 │   Client    │ ◄───────────────► │  LDK-LSP     │
-│  Services   │                   │  (this repo) │
+│  (Alby Hub) │                   │  (this repo) │
 └─────────────┘                   └──────┬───────┘
-                                         │
-                                         │ gRPC
-                                         │
-                              ┌──────────▼──────────┐
-                              │    LDK Server       │
-                              │  (Lightning Node)   │
-                              └─────────────────────┘
+                                          │
+                                          │ gRPC
+                                          │
+                               ┌──────────▼──────────┐
+                               │    LDK Server       │
+                               │  (Lightning Node)   │
+                               └─────────────────────┘
+                                          │
+                                          │ Esplora
+                                          │
+                               ┌──────────▼──────────┐
+                               │   Esplora Server    │
+                               │ (Fee estimates +    │
+                               │  Blockchain data)   │
+                               └─────────────────────┘
 ```
 
 LDK-LSP acts as a layer on top of LDK Server:
 1. Uses `ldk-server-client` to communicate with the Lightning node via gRPC
-2. Provides an HTTP API for external services to purchase channels
-3. Manages channel lifecycle including zeroconf handling and splicing
+2. Provides an HTTP API for external services to request JIT liquidity
+3. Manages channel lifecycle including automatic zeroconf handling
+4. Consumes RabbitMQ events from ldk-server for real-time payment notifications
 
 ## Prerequisites
 
 - Rust 1.70+ 
 - LDK Server instance running (see [LDK Server](https://github.com/lightningdevkit/ldk-server))
-- Bitcoin node (bitcoind) - managed by LDK Server
+- Esplora instance (for fee estimation and blockchain data)
+- RabbitMQ (for event notifications)
 
 ## Quick Start
 
@@ -60,9 +74,21 @@ data_dir = "./data"
 host = "127.0.0.1"
 port = 3009  # Default ldk-server port
 
+[ldk_server.rabbitmq]
+connection_string = "amqp://guest:guest@localhost:5672/%2F"
+exchange_name = "ldk-server"
+
 [lsp]
-channel_open_base_fee = 10000        # 10k sats base fee
-channel_open_fee_ppm = 10000         # 1% fee
+# JIT Receive settings
+jit_receive_base_fee = 1000          # Base fee in sats
+jit_receive_fee_ppm = 5000           # 0.5% fee (parts per million)
+jit_min_receive_amount = 10000       # Minimum 10k sats
+jit_inbound_buffer = 50000           # Extra 50k sats capacity added
+
+# Fee estimation (uses same Esplora as ldk-server)
+fee_confirmation_target = 6          # Target ~1 hour confirmation
+
+# Channel limits
 min_channel_size = 100000            # 100k sats minimum
 max_channel_size = 100000000         # 1 BTC maximum
 enable_zeroconf = true
@@ -81,6 +107,22 @@ url = "sqlite:ldk-lsp.db"
 ```bash
 ./target/release/ldk-lsp
 ```
+
+## How JIT Receive Works
+
+1. **User requests quote**: Client provides their node ID, host, port, and amount they want to receive
+2. **LSP detects channel status**: 
+   - If no channel exists → will open new channel
+   - If channel exists → will splice additional capacity
+3. **Fee calculation**: 
+   - Base fee + PPM fee on amount
+   - Dynamic onchain fee estimate (from Esplora)
+   - Total invoice amount = amount + all fees
+4. **Invoice payment**: User pays the BOLT11 invoice
+5. **Automatic execution**: When payment is detected via RabbitMQ, LSP automatically:
+   - Opens a new channel (with zeroconf), or
+   - Splices in additional funds to existing channel
+6. **Channel capacity**: User receives `amount + jit_inbound_buffer` in channel capacity
 
 ## API Documentation
 
@@ -102,18 +144,19 @@ Response:
 }
 ```
 
-### Request Channel Quote
+### Request JIT Receive Quote
+
+Request inbound liquidity to receive payments.
 
 ```bash
-POST /v1/channels/quote
+POST /v1/receive/quote
 Content-Type: application/json
 
 {
-  "node_id": "...",
-  "host": "...",
+  "node_id": "0288f...",
+  "host": "192.168.1.100",
   "port": 9735,
-  "capacity": 1000000,
-  "require_zeroconf": true
+  "amount": 50000
 }
 ```
 
@@ -122,23 +165,73 @@ Response:
 {
   "success": true,
   "data": {
-    "request_id": "...",
-    "capacity": 1000000,
-    "fee": 20000,
-    "total_cost": 1020000,
-    "lsp_node_id": "...",
-    "expiry": "2024-01-01T12:00:00Z"
+    "receive_id": "550e8400-e29b-41d4-a716-446655440000",
+    "amount": 50000,
+    "fees": {
+      "base": 1000,
+      "ppm": 250,
+      "onchain": 4800,
+      "total": 6050,
+      "fee_rate": 24
+    },
+    "total_invoice_amount": 56050,
+    "is_splice": false,
+    "channel_id": null,
+    "lsp_node_id": "My LSP",
+    "expiry": "2024-01-15T10:30:00Z",
+    "invoice": "lnbc5605010n1p3...",
+    "payment_hash": "abcd1234..."
   }
 }
 ```
 
-### Confirm Channel (after payment)
+**Notes:**
+- `is_splice`: `true` if splicing existing channel, `false` if opening new channel
+- `fee_rate`: The sat/vbyte rate used for onchain fee calculation
+- `total_invoice_amount`: What user pays (amount + fees)
+- Channel will have `amount + jit_inbound_buffer` capacity
+
+### Check Receive Request Status
 
 ```bash
-POST /v1/channels/{request_id}/confirm
+GET /v1/receive/{receive_id}
 ```
 
-### Request Splice Quote
+Response:
+```json
+{
+  "success": true,
+  "data": {
+    "receive_id": "550e8400-e29b-41d4-a716-446655440000",
+    "status": "PendingPayment",
+    "amount": 50000,
+    "is_splice": false,
+    "channel_id": null,
+    "fees": {
+      "base": 1000,
+      "ppm": 250,
+      "onchain": 4800,
+      "total": 6050,
+      "fee_rate": 24
+    },
+    "total_invoice_amount": 56050,
+    "created_at": "2024-01-15T10:20:00Z",
+    "failure_reason": null
+  }
+}
+```
+
+**Status values:**
+- `PendingPayment`: Waiting for invoice to be paid
+- `PaymentReceived`: Payment detected, action starting
+- `ChannelOpening`: New channel opening initiated
+- `SpliceInitiated`: Splice-in initiated
+- `Completed`: Channel/splice ready for use
+- `Failed`: Something went wrong (see `failure_reason`)
+
+### Request Splice Quote (Legacy)
+
+For manual splicing (not through JIT receive flow):
 
 ```bash
 POST /v1/splice/quote
@@ -171,6 +264,7 @@ src/
 ├── main.rs           # Application entry point
 ├── lib.rs            # Library root
 ├── config.rs         # Configuration management
+├── fee.rs            # Dynamic fee estimation from Esplora
 ├── node/             # LDK Server integration
 │   ├── mod.rs        # Node wrapper
 │   ├── client.rs     # gRPC client
@@ -181,14 +275,33 @@ src/
 │   └── splicing.rs   # Channel splicing
 ├── api/              # HTTP API
 │   ├── mod.rs        # API server setup
-│   ├── channels.rs   # Channel endpoints
+│   ├── receive.rs    # JIT receive endpoints
 │   ├── splicing.rs   # Splicing endpoints
-│   ├── payments.rs   # Payment webhooks
 │   └── health.rs     # Health checks
-└── db/               # Database
-    ├── mod.rs        # Database connection
-    ├── models.rs     # Data models
-    └── queries.rs    # Database queries
+├── db/               # Database
+│   ├── mod.rs        # Database connection
+│   ├── models.rs     # Data models
+│   └── queries.rs    # Database queries
+└── rabbitmq.rs       # RabbitMQ event consumer
+```
+
+## Configuration Reference
+
+### JIT Receive Settings
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `jit_receive_base_fee` | 1000 | Base service fee in satoshis |
+| `jit_receive_fee_ppm` | 5000 | PPM fee on receive amount (5000 = 0.5%) |
+| `jit_min_receive_amount` | 10000 | Minimum amount user can request (sats) |
+| `jit_inbound_buffer` | 50000 | Extra inbound capacity added to channel (sats) |
+| `fee_confirmation_target` | 6 | Confirmation target for fee estimation (blocks) |
+
+**Fee Calculation:**
+```
+Total Fee = base_fee + (amount * ppm / 1,000,000) + (200 vbytes * fee_rate)
+Invoice Amount = amount + Total Fee
+Channel Capacity = amount + inbound_buffer
 ```
 
 ## Roadmap
@@ -198,7 +311,10 @@ src/
 - [x] Configuration system
 - [x] Zeroconf channel support
 - [x] Channel splicing support
-- [x] HTTP API for channel requests
+- [x] **JIT Receive (JIT liquidity)**
+- [x] **Dynamic fee estimation from Esplora**
+- [x] **Inbound buffer for extra capacity**
+- [x] RabbitMQ event consumption
 - [ ] Admin dashboard (web UI)
 - [ ] Advanced fee scheduling
 - [ ] Liquidity management tools

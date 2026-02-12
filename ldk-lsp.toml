@@ -40,6 +40,16 @@ max_pending_zeroconf = 1             # Max pending zeroconf channels per peer
 # Confirmation target for channel opens
 confirmation_target = 6
 
+# JIT (Just-In-Time) Receive settings
+jit_receive_base_fee = 500         # Base fee for JIT receive in satoshis
+jit_receive_fee_ppm = 0            # PPM fee for JIT receive (0.5% = 5000)
+jit_min_receive_amount = 0         # Minimum receive amount for JIT
+jit_inbound_buffer = 1000          # Extra inbound liquidity added to channel (satoshis)
+
+# Fee estimator settings (fetches dynamic fees from mempool.space)
+fee_api_url = "https://mempool.space/api/v1/fees/recommended"  # Fee API endpoint
+fee_confirmation_target = 6         # Target confirmation time in blocks (~1 hour)
+
 # API server settings
 [api]
 bind_address = "0.0.0.0:18080"

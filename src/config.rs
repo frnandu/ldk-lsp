@@ -218,6 +218,33 @@ pub struct LspConfig {
     /// Maximum number of pending zeroconf channels per peer
     #[serde(default = "default_max_pending_zeroconf")]
     pub max_pending_zeroconf: u32,
+
+    /// Base fee for JIT receive (satoshis)
+    #[serde(default = "default_jit_receive_base_fee")]
+    pub jit_receive_base_fee: u64,
+
+    /// Fee rate for JIT receive (parts per million)
+    #[serde(default = "default_jit_receive_fee_ppm")]
+    pub jit_receive_fee_ppm: u64,
+
+    /// Minimum receive amount for JIT (satoshis)
+    #[serde(default = "default_jit_min_receive_amount")]
+    pub jit_min_receive_amount: u64,
+
+    /// Extra inbound liquidity buffer for JIT receive (satoshis)
+    /// When opening/splicing a channel, we add this amount on top of what the user paid for
+    /// This gives the user spare inbound liquidity for future receives
+    #[serde(default = "default_jit_inbound_buffer")]
+    pub jit_inbound_buffer: u64,
+
+    /// Fee estimator API URL (optional, defaults to mempool.space)
+    /// Set to empty string to disable dynamic fees and use static estimates
+    #[serde(default = "default_fee_api_url")]
+    pub fee_api_url: String,
+
+    /// Confirmation target for fee estimation (blocks)
+    #[serde(default = "default_fee_confirmation_target")]
+    pub fee_confirmation_target: u32,
 }
 
 impl Default for LspConfig {
@@ -232,6 +259,12 @@ impl Default for LspConfig {
             enable_splicing: true,
             zeroconf_min_size: default_zeroconf_min_size(),
             max_pending_zeroconf: default_max_pending_zeroconf(),
+            jit_receive_base_fee: default_jit_receive_base_fee(),
+            jit_receive_fee_ppm: default_jit_receive_fee_ppm(),
+            jit_min_receive_amount: default_jit_min_receive_amount(),
+            jit_inbound_buffer: default_jit_inbound_buffer(),
+            fee_api_url: default_fee_api_url(),
+            fee_confirmation_target: default_fee_confirmation_target(),
         }
     }
 }
@@ -262,6 +295,30 @@ fn default_zeroconf_min_size() -> u64 {
 
 fn default_max_pending_zeroconf() -> u32 {
     5 // Max 5 pending zeroconf channels per peer
+}
+
+fn default_jit_receive_base_fee() -> u64 {
+    1_000 // 1k sats base fee for JIT
+}
+
+fn default_jit_receive_fee_ppm() -> u64 {
+    5_000 // 0.5% fee for JIT
+}
+
+fn default_jit_min_receive_amount() -> u64 {
+    10_000 // 10k sats minimum for JIT
+}
+
+fn default_jit_inbound_buffer() -> u64 {
+    50_000 // 50k sats extra inbound liquidity by default
+}
+
+fn default_fee_api_url() -> String {
+    "https://mempool.space/api/v1/fees/recommended".to_string()
+}
+
+fn default_fee_confirmation_target() -> u32 {
+    6 // ~1 hour confirmation target
 }
 
 fn default_true() -> bool {
@@ -417,6 +474,14 @@ impl Config {
     pub fn calculate_channel_fee(&self, capacity: u64) -> u64 {
         let ppm_fee = capacity.saturating_mul(self.lsp.channel_open_fee_ppm) / 1_000_000;
         self.lsp.channel_open_base_fee.saturating_add(ppm_fee)
+    }
+
+    /// Calculate JIT receive fee components (excluding onchain fee which comes from LDK)
+    /// Returns: (base_fee, ppm_fee, total_service_fee)
+    pub fn calculate_jit_service_fee(&self, receive_amount: u64) -> (u64, u64, u64) {
+        let ppm_fee = receive_amount.saturating_mul(self.lsp.jit_receive_fee_ppm) / 1_000_000;
+        let total_service_fee = self.lsp.jit_receive_base_fee.saturating_add(ppm_fee);
+        (self.lsp.jit_receive_base_fee, ppm_fee, total_service_fee)
     }
 
     /// Validate the configuration

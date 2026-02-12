@@ -7,7 +7,8 @@
 
 use crate::{
     config::Config,
-    db::{ChannelRequestModel, Database, PaymentModel},
+    db::Database,
+    fee::FeeEstimator,
     node::{ChannelId, LspNode, PaymentId},
     LspError, LspResult,
 };
@@ -27,6 +28,8 @@ pub struct LspService {
     config: Arc<Config>,
     /// Database connection
     db: Arc<Database>,
+    /// Fee estimator for dynamic onchain fees
+    fee_estimator: FeeEstimator,
     /// Zero-confirmation channel service
     pub zeroconf: ZeroconfService,
     /// Channel splicing service
@@ -41,10 +44,13 @@ impl LspService {
     pub fn new(config: Arc<Config>, db: Arc<Database>) -> Self {
         let zeroconf = ZeroconfService::new(config.clone());
         let splicing = SplicingService::new(config.clone());
+        let fee_estimator = FeeEstimator::with_url(config.lsp.fee_api_url.clone())
+            .with_confirmation_target(config.lsp.fee_confirmation_target);
 
         Self {
             config,
             db,
+            fee_estimator,
             zeroconf,
             splicing,
         }
@@ -57,21 +63,17 @@ impl LspService {
         self.zeroconf.init(node.clone()).await?;
         self.splicing.init(node.clone()).await?;
 
-        // Reconcile pending payments on startup
-        self.reconcile_pending_payments(node.clone()).await?;
-        
-        // Reconcile channels in opening state on startup
-        self.reconcile_channel_opening(node.clone()).await?;
+        // Reconcile pending receive requests on startup (JIT liquidity)
+        self.reconcile_pending_receive_requests(node.clone()).await?;
 
         info!("LSP service initialized");
         Ok(())
     }
 
-    /// Reconcile pending payments on startup
-    /// Checks all pending_payment requests and:
-    /// - Deletes requests that are expired (> 1 hour old)
-    /// - Opens channels for requests with received payments
-    async fn reconcile_pending_payments(&self, node: Arc<RwLock<LspNode>>) -> LspResult<()> {
+    // DEPRECATED: Old channel request reconciliation - no longer used
+    // Kept for reference but disabled
+    #[cfg(false)]
+    async fn _reconcile_pending_payments(&self, node: Arc<RwLock<LspNode>>) -> LspResult<()> {
         info!("Reconciling pending payments on startup...");
 
         let queries = crate::db::ChannelRequestQueries::new(&self.db);
@@ -221,7 +223,8 @@ impl LspService {
     /// Checks all channel_opening requests and:
     /// - Updates to channel_opened if channel is ready on ldk-server
     /// - Updates to channel_open_failed if channel doesn't exist or is closed
-    async fn reconcile_channel_opening(&self, node: Arc<RwLock<LspNode>>) -> LspResult<()> {
+    #[cfg(false)]
+    async fn _reconcile_channel_opening(&self, node: Arc<RwLock<LspNode>>) -> LspResult<()> {
         info!("Reconciling channel opening status on startup...");
 
         let queries = crate::db::ChannelRequestQueries::new(&self.db);
@@ -331,9 +334,115 @@ impl LspService {
         Ok(())
     }
 
+    /// Reconcile pending receive requests on startup
+    /// Checks all pending_payment receive requests and:
+    /// - Deletes requests that are expired (> 1 hour old)
+    /// - Triggers actions for requests with received payments
+    async fn reconcile_pending_receive_requests(&self, node: Arc<RwLock<LspNode>>) -> LspResult<()> {
+        info!("Reconciling pending receive requests on startup...");
+
+        let queries = crate::db::ReceiveRequestQueries::new(&self.db);
+        let pending_requests = queries
+            .list_by_status("pending_payment")
+            .await
+            .map_err(|e| LspError::Database(format!("Failed to list pending receive requests: {}", e)))?;
+
+        if pending_requests.is_empty() {
+            info!("No pending receive requests to reconcile");
+            return Ok(());
+        }
+
+        let total_requests = pending_requests.len();
+        info!("Found {} pending receive requests to reconcile", total_requests);
+        let one_hour_ago = chrono::Utc::now() - chrono::Duration::hours(1);
+        let mut processed_count = 0;
+        let mut expired_count = 0;
+        let mut action_triggered_count = 0;
+        let mut payment_failed_count = 0;
+
+        for request in pending_requests {
+            processed_count += 1;
+            
+            // Check if request is expired (> 1 hour old)
+            if request.created_at < one_hour_ago {
+                info!(
+                    "[Receive Reconciliation {}/{}] Deleting expired request {} (created at {})",
+                    processed_count, total_requests, request.id, request.created_at
+                );
+                expired_count += 1;
+                if let Err(e) = queries.delete(&request.id).await {
+                    error!("Failed to delete expired receive request {}: {}", request.id, e);
+                }
+                continue;
+            }
+
+            // Check payment status on ldk-server
+            if let Some(ref payment_hash) = request.payment_hash {
+                info!("[Receive Reconciliation {}/{}] Checking payment {} for request {}", 
+                    processed_count, total_requests, payment_hash, request.id);
+                
+                let payment = {
+                    let node = node.read().await;
+                    node.get_payment(&PaymentId(payment_hash.clone())).await
+                };
+
+                match payment {
+                    Ok(Some(payment)) => {
+                        match payment.status {
+                            crate::node::PaymentStatus::Succeeded => {
+                                action_triggered_count += 1;
+                                info!(
+                                    "[Receive Reconciliation {}/{}] Payment received for request {}, triggering action...",
+                                    processed_count, total_requests, request.id
+                                );
+
+                                // Trigger the action via check_receive_status
+                                if let Err(e) = self.check_receive_status(&request.id, node.clone()).await {
+                                    error!("Failed to trigger action for receive request {}: {}", request.id, e);
+                                }
+                            }
+                            crate::node::PaymentStatus::Failed => {
+                                payment_failed_count += 1;
+                                warn!("[Receive Reconciliation {}/{}] Payment failed for request {}", 
+                                    processed_count, total_requests, request.id);
+                                if let Err(e) = queries
+                                    .update_status_with_reason(&request.id, "failed", None, Some("Payment failed"))
+                                    .await
+                                {
+                                    error!("Failed to update status for receive request {}: {}", request.id, e);
+                                }
+                            }
+                            _ => {
+                                info!("[Receive Reconciliation {}/{}] Payment still pending for request {}", 
+                                    processed_count, total_requests, request.id);
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        info!("[Receive Reconciliation {}/{}] Payment not found on ldk-server for request {}", 
+                            processed_count, total_requests, request.id);
+                    }
+                    Err(e) => {
+                        error!("[Receive Reconciliation {}/{}] Failed to get payment for request {}: {}", 
+                            processed_count, total_requests, request.id, e);
+                    }
+                }
+            } else {
+                warn!("[Receive Reconciliation {}/{}] Request {} has no payment hash, skipping", 
+                    processed_count, total_requests, request.id);
+            }
+        }
+
+        info!("Pending receive request reconciliation completed: {} processed, {} expired deleted, {} actions triggered, {} payments failed, {} still pending", 
+            processed_count, expired_count, action_triggered_count, payment_failed_count, 
+            total_requests - processed_count);
+        Ok(())
+    }
+
     /// Request a new channel from the LSP
     /// Creates invoice, saves the request to the database with payment hash in a single operation
-    pub async fn request_channel(
+    #[cfg(false)]
+    pub async fn _request_channel(
         &self,
         node_id: &str,
         host: &str,
@@ -425,9 +534,161 @@ impl LspService {
         Ok(parsed.payment_hash().to_string())
     }
 
+    /// Request a JIT receive quote
+    /// Creates an invoice for the user to pay, which will trigger either a splice or new channel
+    pub async fn request_receive_quote(
+        &self,
+        node_id: &str,
+        host: &str,
+        port: u16,
+        amount: u64,
+        node: Arc<RwLock<LspNode>>,
+    ) -> LspResult<(ReceiveQuote, String)> {
+        info!(
+            "Receive quote request from {}@{}:{} for {} sats",
+            node_id, host, port, amount
+        );
+
+        // Validate the request
+        self.validate_receive_request(amount)?;
+
+        // Check if user already has a channel with us
+        let existing_channels = {
+            let node_lock = node.read().await;
+            node_lock.get_channels_by_node_id(node_id).await?
+        };
+
+        // Determine if we should splice or open new channel
+        let (is_splice, channel_id) = if let Some(channel) = existing_channels.first() {
+            info!(
+                "Found existing channel {} with {}, will splice",
+                channel.id.0, node_id
+            );
+            (true, Some(channel.id.clone()))
+        } else {
+            info!("No existing channel with {}, will open new channel", node_id);
+            (false, None)
+        };
+
+        // Get dynamic onchain fee estimate
+        let (fee_rate, onchain_fee) = match self.fee_estimator.get_fee_rate().await {
+            Ok(rate) => {
+                let fee = rate.saturating_mul(200); // 200 vbytes
+                info!("Dynamic fee rate: {} sat/vbyte, onchain fee: {} sats", rate, fee);
+                (rate, fee)
+            }
+            Err(e) => {
+                warn!("Failed to get dynamic fee estimate, using fallback: {}", e);
+                // Fallback: 200 vbytes @ 20 sat/vbyte = 4000 sats
+                (20u64, 4_000u64)
+            }
+        };
+
+        // Calculate fees
+        let (base_fee, ppm_fee, service_fee) = self.config.calculate_jit_service_fee(amount);
+        let fee_total = service_fee.saturating_add(onchain_fee);
+        let total_invoice_amount = amount.saturating_add(fee_total);
+
+        // Generate a request ID
+        let receive_id = uuid::Uuid::new_v4().to_string();
+        let now = chrono::Utc::now();
+
+        // Create invoice for payment
+        let invoice = {
+            let node_lock = node.read().await;
+            node_lock.create_invoice(
+                Some(total_invoice_amount * 1000), // Convert to millisatoshis
+                &format!("JIT receive: {} sats to {}", amount, node_id),
+                600, // 10 minute expiry
+            )
+            .await
+            .map_err(|e| LspError::Node(format!("Failed to create invoice: {}", e)))?
+        };
+
+        // Extract payment hash from invoice
+        let payment_hash = Self::extract_payment_hash_from_invoice(&invoice)?;
+
+        // Calculate total channel capacity (amount + inbound buffer)
+        let total_channel_capacity = amount.saturating_add(self.config.lsp.jit_inbound_buffer);
+
+        // Save the request to the database
+        let request_model = crate::db::ReceiveRequestModel {
+            id: receive_id.clone(),
+            node_id: node_id.to_string(),
+            host: host.to_string(),
+            port: port as i32,
+            amount: amount as i64,
+            fee_base: base_fee as i64,
+            fee_ppm: ppm_fee as i64,
+            fee_onchain: onchain_fee as i64,
+            fee_total: fee_total as i64,
+            fee_rate: fee_rate as i64,
+            total_invoice_amount: total_invoice_amount as i64,
+            total_channel_capacity: total_channel_capacity as i64,
+            is_splice,
+            channel_id: channel_id.as_ref().map(|c| c.0.clone()),
+            status: "pending_payment".to_string(),
+            payment_hash: Some(payment_hash.clone()),
+            failure_reason: None,
+            created_at: now,
+            updated_at: now,
+        };
+
+        let queries = crate::db::ReceiveRequestQueries::new(&self.db);
+        queries
+            .insert(&request_model)
+            .await
+            .map_err(|e| LspError::Database(format!("Failed to save receive request: {}", e)))?;
+
+        info!(
+            "Receive quote generated and saved to DB: receive_id={}, amount={}, is_splice={}, total={}, payment_hash={}",
+            receive_id, amount, is_splice, total_invoice_amount, payment_hash
+        );
+
+        let quote = ReceiveQuote {
+            receive_id,
+            amount,
+            fee_base: base_fee,
+            fee_ppm: ppm_fee,
+            fee_onchain: onchain_fee,
+            fee_total,
+            fee_rate,
+            total_invoice_amount,
+            is_splice,
+            channel_id,
+            lsp_node_id: self.config.node.alias.clone(),
+            expiry: now + chrono::Duration::minutes(10),
+            payment_hash,
+        };
+
+        Ok((quote, invoice))
+    }
+
+    /// Validate a receive request
+    fn validate_receive_request(&self, amount: u64) -> LspResult<()> {
+        // Check minimum amount
+        if amount < self.config.lsp.jit_min_receive_amount {
+            return Err(LspError::Validation(format!(
+                "Receive amount {} is below minimum {}",
+                amount, self.config.lsp.jit_min_receive_amount
+            )));
+        }
+
+        // Check maximum amount (use max_channel_size as upper bound)
+        if amount > self.config.lsp.max_channel_size {
+            return Err(LspError::Validation(format!(
+                "Receive amount {} exceeds maximum {}",
+                amount, self.config.lsp.max_channel_size
+            )));
+        }
+
+        Ok(())
+    }
+
     /// Check the status of a channel request
     /// If payment is detected on ldk-server, opens the channel
-    pub async fn check_request_status(
+    #[cfg(false)]
+    pub async fn _check_request_status(
         &self,
         request_id: &str,
         node: Arc<RwLock<LspNode>>,
@@ -541,7 +802,8 @@ impl LspService {
     }
 
     /// Get a channel request by ID
-    pub async fn get_request(&self, request_id: &str) -> LspResult<Option<ChannelRequest>> {
+    #[cfg(false)]
+    pub async fn _get_request(&self, request_id: &str) -> LspResult<Option<ChannelRequest>> {
         let queries = crate::db::ChannelRequestQueries::new(&self.db);
         let model = queries
             .get_by_id(request_id)
@@ -576,7 +838,8 @@ impl LspService {
     }
 
     /// Handle a splice request to increase channel capacity
-    pub async fn request_splice(
+    #[cfg(false)]
+    pub async fn _request_splice(
         &self,
         channel_id: &ChannelId,
         additional_capacity: u64,
@@ -605,19 +868,23 @@ impl LspService {
         let fee = self.config.calculate_channel_fee(additional_capacity);
         let total_cost = additional_capacity + fee;
 
-        // Verify the channel exists
-        let channel = {
+        // Verify the channel exists and get its current capacity
+        let channel_info = {
             let node = node.read().await;
             node.get_channel(channel_id).await?
         };
 
-        if channel.is_none() {
-            return Err(LspError::Channel(format!(
-                "Channel {} not found",
-                channel_id
-            )));
-        }
+        let channel = match channel_info {
+            Some(c) => c,
+            None => {
+                return Err(LspError::Channel(format!(
+                    "Channel {} not found",
+                    channel_id
+                )));
+            }
+        };
 
+        let original_capacity = channel.capacity_sat;
         let splice_id = uuid::Uuid::new_v4().to_string();
         let now = chrono::Utc::now();
 
@@ -646,6 +913,7 @@ impl LspService {
             status: "pending_payment".to_string(),
             txid: None,
             payment_hash: Some(payment_hash.clone()),
+            original_capacity: Some(original_capacity as i64),
             created_at: now,
             updated_at: now,
         };
@@ -657,8 +925,8 @@ impl LspService {
             .map_err(|e| LspError::Database(format!("Failed to save splice request: {}", e)))?;
 
         info!(
-            "Splice quote generated and saved to DB: splice_id={}, additional_capacity={}, fee={}, total={}, payment_hash={}",
-            splice_id, additional_capacity, fee, total_cost, payment_hash
+            "Splice quote generated and saved to DB: splice_id={}, channel_id={}, original_capacity={}, additional_capacity={}, fee={}, total={}, payment_hash={}",
+            splice_id, channel_id, original_capacity, additional_capacity, fee, total_cost, payment_hash
         );
 
         let quote = SpliceQuote {
@@ -711,6 +979,258 @@ impl LspService {
     /// Get a splice request by ID (delegates to splicing service)
     pub async fn get_splice_request(&self, splice_id: &str) -> Option<crate::lsp::SpliceRequest> {
         self.splicing.get_splice_request(splice_id).await
+    }
+
+    /// Get a receive request by ID
+    pub async fn get_receive_request(&self, receive_id: &str) -> LspResult<Option<ReceiveRequest>> {
+        let queries = crate::db::ReceiveRequestQueries::new(&self.db);
+        let model = queries
+            .get_by_id(receive_id)
+            .await
+            .map_err(|e| LspError::Database(format!("Failed to get receive request: {}", e)))?;
+
+        Ok(model.map(|m| ReceiveRequest {
+            id: m.id,
+            node_id: m.node_id,
+            host: m.host,
+            port: m.port as u16,
+            amount: m.amount as u64,
+            fee_base: m.fee_base as u64,
+            fee_ppm: m.fee_ppm as u64,
+            fee_onchain: m.fee_onchain as u64,
+            fee_total: m.fee_total as u64,
+            fee_rate: m.fee_rate as u64,
+            total_invoice_amount: m.total_invoice_amount as u64,
+            is_splice: m.is_splice,
+            channel_id: m.channel_id.clone().map(ChannelId),
+            status: match m.status.as_str() {
+                "pending_payment" => ReceiveRequestStatus::PendingPayment,
+                "channel_opening" => ReceiveRequestStatus::ChannelOpening,
+                "channel_opened" => {
+                    if let Some(cid) = m.channel_id.clone() {
+                        ReceiveRequestStatus::ChannelOpened(ChannelId(cid))
+                    } else {
+                        ReceiveRequestStatus::PendingPayment
+                    }
+                }
+                "splice_initiated" => ReceiveRequestStatus::SpliceInitiated,
+                "splice_completed" => {
+                    if let Some(cid) = m.channel_id.clone() {
+                        ReceiveRequestStatus::SpliceCompleted(ChannelId(cid))
+                    } else {
+                        ReceiveRequestStatus::SpliceInitiated
+                    }
+                }
+                "completed" => {
+                    if let Some(cid) = m.channel_id.clone() {
+                        ReceiveRequestStatus::Completed(ChannelId(cid))
+                    } else {
+                        ReceiveRequestStatus::PendingPayment
+                    }
+                }
+                "expired" => ReceiveRequestStatus::Expired,
+                "failed" => ReceiveRequestStatus::Failed(m.failure_reason.clone().unwrap_or_default()),
+                _ => ReceiveRequestStatus::PendingPayment,
+            },
+            payment_hash: m.payment_hash,
+            failure_reason: m.failure_reason,
+            created_at: m.created_at,
+        }))
+    }
+
+    /// Check the status of a receive request
+    /// If payment is detected on ldk-server, triggers the appropriate action
+    pub async fn check_receive_status(
+        &self,
+        receive_id: &str,
+        node: Arc<RwLock<LspNode>>,
+    ) -> LspResult<ReceiveRequestStatus> {
+        debug!("Checking status for receive request: {}", receive_id);
+
+        // Get request from database
+        let queries = crate::db::ReceiveRequestQueries::new(&self.db);
+        let request = queries
+            .get_by_id(receive_id)
+            .await
+            .map_err(|e| LspError::Database(format!("Failed to get receive request: {}", e)))?
+            .ok_or_else(|| LspError::Validation(format!("Receive request not found: {}", receive_id)))?;
+
+        // Check current status
+        match request.status.as_str() {
+            "completed" | "channel_opened" | "splice_completed" => {
+                if let Some(channel_id) = request.channel_id {
+                    return Ok(ReceiveRequestStatus::Completed(ChannelId(channel_id)));
+                }
+            }
+            "channel_opening" => return Ok(ReceiveRequestStatus::ChannelOpening),
+            "splice_initiated" => return Ok(ReceiveRequestStatus::SpliceInitiated),
+            "expired" => return Ok(ReceiveRequestStatus::Expired),
+            "failed" => {
+                return Ok(ReceiveRequestStatus::Failed(
+                    request.failure_reason.unwrap_or_default(),
+                ))
+            }
+            _ => {} // pending_payment - check if paid
+        }
+
+        // If pending payment, check if invoice is paid on ldk-server
+        if let Some(ref payment_hash) = request.payment_hash {
+            let payment = {
+                let node = node.read().await;
+                node.get_payment(&PaymentId(payment_hash.clone())).await?
+            };
+
+            if let Some(payment) = payment {
+                match payment.status {
+                    crate::node::PaymentStatus::Succeeded => {
+                        info!("Payment received for receive request {}, triggering action...", receive_id);
+
+                        if request.is_splice {
+                            // Trigger splice
+                            queries
+                                .update_status(receive_id, "splice_initiated", request.channel_id.as_deref())
+                                .await
+                                .map_err(|e| LspError::Database(format!("Failed to update status: {}", e)))?;
+
+                            // Get channel details and splice
+                            if let Some(ref channel_id_str) = request.channel_id {
+                                let channel_info = {
+                                    let node = node.read().await;
+                                    node.get_channel(&ChannelId(channel_id_str.clone())).await?
+                                };
+
+                                if let Some(channel) = channel_info {
+                                    // Use total channel capacity from request (includes inbound buffer)
+                                    let splice_amount = request.total_channel_capacity as u64;
+                                    info!("Splicing in {} sats (requested: {} + buffer: {})", 
+                                        splice_amount, request.amount, splice_amount - (request.amount as u64));
+                                    
+                                    let splice_result = async {
+                                        let node = node.read().await;
+                                        node.splice_in(
+                                            &channel.user_channel_id,
+                                            &channel.counterparty_node_id,
+                                            splice_amount,
+                                        )
+                                        .await
+                                    }
+                                    .await;
+
+                                    match splice_result {
+                                        Ok(()) => {
+                                            info!("Splice initiated for receive request {}", receive_id);
+                                            return Ok(ReceiveRequestStatus::SpliceInitiated);
+                                        }
+                                        Err(e) => {
+                                            error!("Failed to initiate splice: {}", e);
+                                            queries
+                                                .update_status_with_reason(
+                                                    receive_id,
+                                                    "failed",
+                                                    Some(channel_id_str),
+                                                    Some(&format!("Failed to splice: {}", e)),
+                                                )
+                                                .await
+                                                .map_err(|e| {
+                                                    LspError::Database(format!("Failed to update status: {}", e))
+                                                })?;
+                                            return Ok(ReceiveRequestStatus::Failed(format!(
+                                                "Splice failed: {}",
+                                                e
+                                            )));
+                                        }
+                                    }
+                                } else {
+                                    error!("Channel {} not found for splice", channel_id_str);
+                                    queries
+                                        .update_status_with_reason(
+                                            receive_id,
+                                            "failed",
+                                            Some(channel_id_str),
+                                            Some("Channel not found"),
+                                        )
+                                        .await
+                                        .map_err(|e| LspError::Database(format!("Failed to update status: {}", e)))?;
+                                    return Ok(ReceiveRequestStatus::Failed(
+                                        "Channel not found".to_string(),
+                                    ));
+                                }
+                            }
+                        } else {
+                            // Open new channel
+                            queries
+                                .update_status(receive_id, "channel_opening", None)
+                                .await
+                                .map_err(|e| LspError::Database(format!("Failed to update status: {}", e)))?;
+
+                            let address = format!("{}:{}", request.host, request.port);
+                            // Use total channel capacity from request (includes inbound buffer)
+                            let channel_capacity = request.total_channel_capacity as u64;
+                            info!("Opening channel with {} sats capacity (requested: {} + buffer: {})", 
+                                channel_capacity, request.amount, channel_capacity - (request.amount as u64));
+                            
+                            let channel_id = {
+                                let node = node.read().await;
+                                node.open_channel(
+                                    &request.node_id,
+                                    &address,
+                                    channel_capacity,
+                                    0,     // No push MSAT
+                                    false, // Private channel (not announced)
+                                )
+                                .await?
+                            };
+
+                            // Update with channel_id while keeping status as "channel_opening"
+                            // The RabbitMQ handler will update to "completed" when channel is ready
+                            queries
+                                .update_status(receive_id, "channel_opening", Some(&channel_id.0))
+                                .await
+                                .map_err(|e| LspError::Database(format!("Failed to update channel_id: {}", e)))?;
+
+                            info!(
+                                "Channel opening initiated for receive request {}: channel_id={}",
+                                receive_id, channel_id
+                            );
+
+                            return Ok(ReceiveRequestStatus::ChannelOpened(channel_id));
+                        }
+                    }
+                    crate::node::PaymentStatus::Failed => {
+                        warn!("Payment failed for receive request {}", receive_id);
+                        queries
+                            .update_status_with_reason(receive_id, "failed", None, Some("Payment failed"))
+                            .await
+                            .map_err(|e| LspError::Database(format!("Failed to update status: {}", e)))?;
+                        return Ok(ReceiveRequestStatus::Failed("Payment failed".to_string()));
+                    }
+                    _ => {
+                        debug!("Payment still pending for receive request {}", receive_id);
+                    }
+                }
+            } else {
+                debug!("Payment not found on ldk-server for receive request {}", receive_id);
+            }
+        }
+
+        // If payment_hash is missing, the request is corrupted
+        if request.payment_hash.is_none() {
+            return Err(LspError::Database(
+                "Receive request has no payment hash".to_string(),
+            ));
+        }
+
+        // Check if expired
+        let expiry = request.created_at + chrono::Duration::minutes(10);
+        if chrono::Utc::now() > expiry {
+            queries
+                .update_status(receive_id, "expired", None)
+                .await
+                .map_err(|e| LspError::Database(format!("Failed to update status: {}", e)))?;
+            return Ok(ReceiveRequestStatus::Expired);
+        }
+
+        Ok(ReceiveRequestStatus::PendingPayment)
     }
 }
 
@@ -792,4 +1312,95 @@ pub enum ChannelRequestStatus {
     Expired,
     /// Request cancelled
     Cancelled,
+}
+
+/// A receive quote for JIT liquidity
+#[derive(Debug, Clone)]
+pub struct ReceiveQuote {
+    /// Unique request ID
+    pub receive_id: String,
+    /// Amount user wants to receive
+    pub amount: u64,
+    /// Base LSP fee
+    pub fee_base: u64,
+    /// PPM fee
+    pub fee_ppm: u64,
+    /// Estimated onchain fee
+    pub fee_onchain: u64,
+    /// Total fee
+    pub fee_total: u64,
+    /// Fee rate used for onchain calculation (sat/vbyte)
+    pub fee_rate: u64,
+    /// Total invoice amount
+    pub total_invoice_amount: u64,
+    /// Whether this will be a splice
+    pub is_splice: bool,
+    /// Channel ID (if splice)
+    pub channel_id: Option<ChannelId>,
+    /// LSP node ID
+    pub lsp_node_id: String,
+    /// Quote expiry time
+    pub expiry: chrono::DateTime<chrono::Utc>,
+    /// Payment hash for the invoice
+    pub payment_hash: String,
+}
+
+/// A receive request
+#[derive(Debug, Clone)]
+pub struct ReceiveRequest {
+    /// Unique request ID
+    pub id: String,
+    /// Client node ID
+    pub node_id: String,
+    /// Client host
+    pub host: String,
+    /// Client port
+    pub port: u16,
+    /// Amount to receive
+    pub amount: u64,
+    /// Base fee
+    pub fee_base: u64,
+    /// PPM fee
+    pub fee_ppm: u64,
+    /// Onchain fee estimate
+    pub fee_onchain: u64,
+    /// Total fee
+    pub fee_total: u64,
+    /// Fee rate used for onchain calculation (sat/vbyte)
+    pub fee_rate: u64,
+    /// Total invoice amount
+    pub total_invoice_amount: u64,
+    /// Whether this is a splice
+    pub is_splice: bool,
+    /// Channel ID
+    pub channel_id: Option<ChannelId>,
+    /// Request status
+    pub status: ReceiveRequestStatus,
+    /// Payment hash
+    pub payment_hash: Option<String>,
+    /// Failure reason
+    pub failure_reason: Option<String>,
+    /// Creation time
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Receive request status
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReceiveRequestStatus {
+    /// Waiting for payment
+    PendingPayment,
+    /// Payment received, opening channel
+    ChannelOpening,
+    /// Channel opened
+    ChannelOpened(ChannelId),
+    /// Payment received, splicing
+    SpliceInitiated,
+    /// Splice completed
+    SpliceCompleted(ChannelId),
+    /// Request completed successfully
+    Completed(ChannelId),
+    /// Request expired
+    Expired,
+    /// Request failed
+    Failed(String),
 }

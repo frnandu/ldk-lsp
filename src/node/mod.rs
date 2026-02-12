@@ -140,6 +140,16 @@ impl LspNode {
         Ok(channels.into_iter().find(|c| c.id == *channel_id))
     }
 
+    /// Get channels by counterparty node ID
+    pub async fn get_channels_by_node_id(&self, node_id: &str) -> LspResult<Vec<ChannelInfo>> {
+        let channels = self.list_channels().await?;
+        let filtered: Vec<ChannelInfo> = channels
+            .into_iter()
+            .filter(|c| c.counterparty_node_id == node_id)
+            .collect();
+        Ok(filtered)
+    }
+
     /// Create an invoice
     pub async fn create_invoice(
         &self,
@@ -161,6 +171,17 @@ impl LspNode {
     pub async fn get_payment(&self, payment_id: &PaymentId) -> LspResult<Option<PaymentInfo>> {
         let client = self.client()?;
         client.get_payment(payment_id).await
+    }
+
+    /// Splice in funds to increase channel capacity
+    pub async fn splice_in(
+        &self,
+        user_channel_id: &str,
+        counterparty_node_id: &str,
+        splice_amount_sats: u64,
+    ) -> LspResult<()> {
+        let client = self.client()?;
+        client.splice_in(user_channel_id, counterparty_node_id, splice_amount_sats).await
     }
 }
 

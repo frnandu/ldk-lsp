@@ -5,7 +5,7 @@
 
 use crate::{
     config::RabbitMqConfig,
-    db::{ChannelRequestQueries, Database},
+    db::{Database, ReceiveRequestQueries},
     node::{ChannelId, LspNode, PaymentId},
     LspResult,
 };
@@ -207,70 +207,119 @@ impl RabbitMqConsumer {
                         payment_hash, amount_msat
                     );
 
-                    // Check if this payment is for a channel request
-                    let queries = ChannelRequestQueries::new(db);
+                    // DEPRECATED: Old channel request handling removed
+                    // Only JIT receive requests are processed now
                     
-                    // Find request by payment hash
-                    debug!("Looking for channel request with payment_hash: {}", payment_hash);
-                    let request = queries.get_by_payment_hash(&payment_hash).await?;
+                    // Also check if this payment is for a receive request
+                    let receive_queries = crate::db::ReceiveRequestQueries::new(db);
                     
-                    if let Some(request) = request {
-                        debug!("Found channel request {} with status: {}", request.id, request.status);
+                    debug!("Looking for receive request with payment_hash: {}", payment_hash);
+                    let receive_request = receive_queries.get_by_payment_hash(&payment_hash).await?;
+                    
+                    if let Some(receive_req) = receive_request {
+                        debug!("Found receive request {} with status: {}", receive_req.id, receive_req.status);
                         
                         // Only process if still pending payment
-                        if request.status == "pending_payment" {
+                        if receive_req.status == "pending_payment" {
                             info!(
-                                "Payment received for channel request: {}",
-                                request.id
+                                "Payment received for receive request: {}",
+                                receive_req.id
                             );
 
                             // Update status to payment_received
-                            queries
-                                .update_status(&request.id, "payment_received", None)
+                            receive_queries
+                                .update_status(&receive_req.id, "payment_received", None)
                                 .await?;
 
-                            // Open the channel
-                            let address = format!("{}:{}", request.host, request.port);
-                            let channel_open_result = async {
-                                let node = node.read().await;
-                                node.open_channel(
-                                    &request.node_id,
-                                    &address,
-                                    request.capacity as u64,
-                                    0,
-                                    false, // Private channel (not announced)
-                                )
-                                .await
-                            }.await;
-                            
-                            match channel_open_result {
-                                Ok(cid) => {
-                                    info!("Channel creation initiated for request {}: user_channel_id={}", request.id, cid);
-                                    // Update status to channel_opening (initiated but not yet confirmed)
-                                    // ChannelStateChange event will update this to channel_opened when ready
-                                    queries
-                                        .update_status(&request.id, "channel_opening", Some(&cid.0))
+                            if receive_req.is_splice {
+                                // Get channel details to find user_channel_id and counterparty_node_id
+                                let channel_info = {
+                                    let node = node.read().await;
+                                    node.get_channel(&ChannelId(receive_req.channel_id.clone().unwrap_or_default())).await?
+                                };
+                                
+                                if let Some(channel) = channel_info {
+                                    // Use total channel capacity from request (includes inbound buffer)
+                                    let splice_amount = receive_req.total_channel_capacity as u64;
+                                    info!("Splicing in {} sats (requested: {} + buffer: {})", 
+                                        splice_amount, receive_req.amount, splice_amount - (receive_req.amount as u64));
+                                    
+                                    // Execute the splice-in
+                                    let splice_result = async {
+                                        let node = node.read().await;
+                                        node.splice_in(
+                                            &channel.user_channel_id,
+                                            &channel.counterparty_node_id,
+                                            splice_amount,
+                                        )
+                                        .await
+                                    }.await;
+                                    
+                                    match splice_result {
+                                        Ok(()) => {
+                                            info!("Splice-in initiated for receive request {}", receive_req.id);
+                                            // Update status to splice_initiated
+                                            receive_queries
+                                                .update_status(&receive_req.id, "splice_initiated", Some(&channel.id.0))
+                                                .await?;
+                                        }
+                                        Err(e) => {
+                                            error!("Failed to initiate splice-in: {}", e);
+                                            receive_queries
+                                                .update_status_with_reason(&receive_req.id, "failed", Some(&channel.id.0), Some(&format!("Splice failed: {}", e)))
+                                                .await?;
+                                        }
+                                    }
+                                } else {
+                                    error!("Channel {} not found for receive request {}", receive_req.channel_id.clone().unwrap_or_default(), receive_req.id);
+                                    receive_queries
+                                        .update_status_with_reason(&receive_req.id, "failed", receive_req.channel_id.as_deref(), Some("Channel not found"))
                                         .await?;
                                 }
-                                Err(e) => {
-                                    error!("Failed to initiate channel opening: {}", e);
-                                    queries
-                                        .update_status(
-                                            &request.id,
-                                            "channel_open_failed",
-                                            None,
-                                        )
-                                        .await?;
+                            } else {
+                                // Open new channel
+                                let address = format!("{}:{}", receive_req.host, receive_req.port);
+                                // Use total channel capacity from request (includes inbound buffer)
+                                let channel_capacity = receive_req.total_channel_capacity as u64;
+                                info!("Opening channel with {} sats capacity (requested: {} + buffer: {})", 
+                                    channel_capacity, receive_req.amount, channel_capacity - (receive_req.amount as u64));
+                                
+                                let channel_open_result = async {
+                                    let node = node.read().await;
+                                    node.open_channel(
+                                        &receive_req.node_id,
+                                        &address,
+                                        channel_capacity,
+                                        0,
+                                        false, // Private channel
+                                    )
+                                    .await
+                                }.await;
+                                
+                                match channel_open_result {
+                                    Ok(cid) => {
+                                        info!("Channel creation initiated for receive request {}: user_channel_id={}", receive_req.id, cid);
+                                        // Update status to channel_opening
+                                        receive_queries
+                                            .update_status(&receive_req.id, "channel_opening", Some(&cid.0))
+                                            .await?;
+                                    }
+                                    Err(e) => {
+                                        error!("Failed to initiate channel opening: {}", e);
+                                        receive_queries
+                                            .update_status_with_reason(&receive_req.id, "failed", None, Some(&format!("Channel open failed: {}", e)))
+                                            .await?;
+                                    }
                                 }
                             }
                         } else {
                             debug!(
-                                "Request {} is not in pending_payment status (current: {})",
-                                request.id, request.status
+                                "Receive request {} is not in pending_payment status (current: {})",
+                                receive_req.id, receive_req.status
                             );
                         }
                     } else {
-                        debug!("No channel request found for payment_hash: {}", payment_hash);
+                        debug!("No receive request found for payment_hash: {}", payment_hash);
                     }
                 }
             }
@@ -306,43 +355,91 @@ impl RabbitMqConsumer {
                         user_channel_id, state
                     );
                     
-                    // Check if this channel belongs to a pending channel request
-                    let queries = ChannelRequestQueries::new(db);
+                    // DEPRECATED: Old channel request and splice handling removed
+                    // Check if this channel state change is for a pending receive request
+                    let receive_queries = ReceiveRequestQueries::new(db);
+                    let receive_queries = crate::db::ReceiveRequestQueries::new(db);
                     
-                    // Find request by channel_id (stored as user_channel_id)
-                    match queries.get_by_channel_id(user_channel_id).await {
-                        Ok(Some(request)) => {
-                            if request.status == "channel_opening" {
+                    // Find receive requests by channel_id that are in channel_opening or splice_initiated status
+                    match receive_queries.get_by_channel_id_and_status(&channel.channel_id, "channel_opening").await {
+                        Ok(receive_requests) => {
+                            for receive_req in receive_requests {
                                 match state {
                                     1 => { // READY = 1
-                                        queries
-                                            .update_status(&request.id, "channel_opened", Some(user_channel_id))
+                                        receive_queries
+                                            .update_status(&receive_req.id, "completed", Some(&channel.channel_id))
                                             .await?;
                                         info!(
-                                            "Channel {} confirmed opened for request {}",
-                                            user_channel_id, request.id
+                                            "Channel ready for receive request {}: channel_id={}",
+                                            receive_req.id, channel.channel_id
                                         );
                                     }
                                     2 => { // CLOSED = 2
-                                        queries
-                                            .update_status_with_reason(&request.id, "channel_open_failed", Some(user_channel_id), Some("Channel closed before ready"))
+                                        receive_queries
+                                            .update_status_with_reason(&receive_req.id, "failed", Some(&channel.channel_id), Some("Channel closed"))
                                             .await?;
                                         error!(
-                                            "Channel {} failed to open (closed) for request {}",
-                                            user_channel_id, request.id
+                                            "Channel {} closed for receive request {}",
+                                            channel.channel_id, receive_req.id
                                         );
                                     }
                                     _ => {
-                                        debug!("Channel {} in pending state", user_channel_id);
+                                        debug!("Channel {} state changed to {} for receive request {}", channel.channel_id, state, receive_req.id);
                                     }
                                 }
                             }
                         }
-                        Ok(None) => {
-                            debug!("No channel request found for user_channel_id: {}", user_channel_id);
+                        Err(e) => {
+                            error!("Failed to get receive requests for channel: {}", e);
+                        }
+                    }
+                    
+                    // Also check splice_initiated receive requests
+                    match receive_queries.get_by_channel_id_and_status(&channel.channel_id, "splice_initiated").await {
+                        Ok(receive_requests) => {
+                            for receive_req in receive_requests {
+                                match state {
+                                    1 => { // READY = 1
+                                        // Verify the splice was successful by checking capacity
+                                        let new_capacity = channel.channel_value_sats;
+                                        let expected_capacity = receive_req.amount as u64;
+                                        let capacity_increased = new_capacity >= expected_capacity.saturating_sub(expected_capacity / 100);
+                                        
+                                        if capacity_increased {
+                                            receive_queries
+                                                .update_status(&receive_req.id, "completed", Some(&channel.channel_id))
+                                                .await?;
+                                            info!(
+                                                "Splice completed for receive request {}: channel_id={}, new_capacity={}",
+                                                receive_req.id, channel.channel_id, new_capacity
+                                            );
+                                        } else {
+                                            receive_queries
+                                                .update_status(&receive_req.id, "splice_verification_failed", Some(&channel.channel_id))
+                                                .await?;
+                                            warn!(
+                                                "Splice verification failed for receive request {}: channel_id={}, new_capacity={}, expected={}",
+                                                receive_req.id, channel.channel_id, new_capacity, expected_capacity
+                                            );
+                                        }
+                                    }
+                                    2 => { // CLOSED = 2
+                                        receive_queries
+                                            .update_status_with_reason(&receive_req.id, "failed", Some(&channel.channel_id), Some("Channel closed"))
+                                            .await?;
+                                        error!(
+                                            "Channel {} closed during splice for receive request {}",
+                                            channel.channel_id, receive_req.id
+                                        );
+                                    }
+                                    _ => {
+                                        debug!("Channel {} state changed to {} during splice for receive request {}", channel.channel_id, state, receive_req.id);
+                                    }
+                                }
+                            }
                         }
                         Err(e) => {
-                            error!("Failed to get channel request: {}", e);
+                            error!("Failed to get receive requests for channel: {}", e);
                         }
                     }
                 }
@@ -358,39 +455,7 @@ impl RabbitMqConsumer {
                     user_channel_id, is_open_failure, is_force_close, reason_description
                 );
                 
-                // Check if this channel belongs to a pending channel request
-                let queries = ChannelRequestQueries::new(db);
-                
-                match queries.get_by_channel_id(user_channel_id).await {
-                    Ok(Some(request)) => {
-                        if is_open_failure {
-                            // Channel failed to open (never became ready)
-                            queries
-                                .update_status_with_reason(&request.id, "channel_open_failed", Some(user_channel_id), Some(reason_description))
-                                .await?;
-                            error!(
-                                "Channel {} failed to open for request {}: {}",
-                                user_channel_id, request.id, reason_description
-                            );
-                        } else {
-                            // Channel was closed after being ready
-                            let close_status = if is_force_close { "force_closed" } else { "closed" };
-                            queries
-                                .update_status_with_reason(&request.id, close_status, Some(user_channel_id), Some(reason_description))
-                                .await?;
-                            info!(
-                                "Channel {} {} for request {}: {}",
-                                user_channel_id, close_status, request.id, reason_description
-                            );
-                        }
-                    }
-                    Ok(None) => {
-                        debug!("No channel request found for user_channel_id: {}", user_channel_id);
-                    }
-                    Err(e) => {
-                        error!("Failed to get channel request: {}", e);
-                    }
-                }
+                // DEPRECATED: Old channel request handling removed
             }
             None => {
                 debug!("Received event envelope with no event data");

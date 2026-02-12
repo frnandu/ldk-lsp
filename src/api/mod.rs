@@ -22,11 +22,13 @@ use tracing::{debug, error, info, warn};
 mod channels;
 mod health;
 mod payments;
+mod receive;
 mod splicing;
 
 pub use channels::*;
 pub use health::*;
 pub use payments::*;
+pub use receive::*;
 pub use splicing::*;
 
 /// API state shared across handlers
@@ -43,10 +45,9 @@ fn build_router(app: LspApp) -> Router {
     Router::new()
         // Health check
         .route("/health", get(health_check))
-        // Channel endpoints
-        .route("/v1/channels/quote", post(request_channel_quote))
-        .route("/v1/channels/:request_id/confirm", post(confirm_channel))
-        .route("/v1/channels/:request_id", get(get_channel_request))
+        // Receive endpoints (JIT liquidity)
+        .route("/v1/receive/quote", post(request_receive_quote))
+        .route("/v1/receive/:receive_id", get(get_receive_request))
         // Splicing endpoints
         .route("/v1/splice/quote", post(request_splice_quote))
         .route("/v1/splice/:splice_id/confirm", post(confirm_splice))

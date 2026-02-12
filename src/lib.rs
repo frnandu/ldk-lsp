@@ -23,6 +23,7 @@
 pub mod api;
 pub mod config;
 pub mod db;
+pub mod fee;
 pub mod lsp;
 pub mod node;
 pub mod rabbitmq;
