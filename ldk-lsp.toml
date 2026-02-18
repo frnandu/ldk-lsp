@@ -12,7 +12,8 @@ host = "127.0.0.1"
 port = 10009
 tls_certificate = "/home/fmar/.ldk-server/tls.crt"  # Optional: for TLS connections
 #auth_token = "your-auth-token"  # Optional: if ldk-server requires auth
-api_key_file = "/home/fmar/.ldk-server/bitcoin/api_key"  # Optional: if ldk-server uses API keys
+#api_key_file = "/home/fmar/.ldk-server/bitcoin/api_key"  # Optional: if ldk-server uses API keys
+api_key_file = "/home/fmar/.ldk-server/signet/api_key"  # Optional: if ldk-server uses API keys
 timeout_seconds = 30
 
 [ldk_server.rabbitmq]
@@ -26,8 +27,8 @@ channel_open_base_fee = 100        # Base fee in satoshis (10k sats)
 channel_open_fee_ppm = 1000         # Fee rate in parts per million (1% = 10000)
 
 # Channel size limits
-min_channel_size = 1000            # Minimum channel size: 100k sats
-max_channel_size = 100000000         # Maximum channel size: 1 BTC
+min_channel_size = 10000            # Minimum channel size: 10k sats
+max_channel_size = 1000000         # Maximum channel size: 0.01 BTC
 
 # Feature toggles
 enable_zeroconf = true
@@ -44,10 +45,12 @@ confirmation_target = 6
 jit_receive_base_fee = 500         # Base fee for JIT receive in satoshis
 jit_receive_fee_ppm = 0            # PPM fee for JIT receive (0.5% = 5000)
 jit_min_receive_amount = 0         # Minimum receive amount for JIT
-jit_inbound_buffer = 1000          # Extra inbound liquidity added to channel (satoshis)
+jit_inbound_buffer = 10000          # Extra inbound liquidity added to channel (satoshis)
+channel_reserve = 1000             # Channel reserve amount in satoshis (added to invoice)
 
 # Fee estimator settings (fetches dynamic fees from mempool.space)
-fee_api_url = "https://mempool.space/api/v1/fees/recommended"  # Fee API endpoint
+#fee_api_url = "https://mempool.space/api/v1/fees/recommended"  # Fee API endpoint
+fee_api_url = "https://mutinynet.com/api/v1/fees/recommended"  # Fee API endpoint
 fee_confirmation_target = 6         # Target confirmation time in blocks (~1 hour)
 
 # API server settings

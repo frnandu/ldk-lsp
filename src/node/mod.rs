@@ -134,10 +134,10 @@ impl LspNode {
         client.list_channels().await
     }
 
-    /// Get a specific channel
-    pub async fn get_channel(&self, channel_id: &ChannelId) -> LspResult<Option<ChannelInfo>> {
+    /// Get a specific channel by user_channel_id (short version stored in DB)
+    pub async fn get_channel(&self, user_channel_id: &ChannelId) -> LspResult<Option<ChannelInfo>> {
         let channels = self.list_channels().await?;
-        Ok(channels.into_iter().find(|c| c.id == *channel_id))
+        Ok(channels.into_iter().find(|c| c.user_channel_id == user_channel_id.0))
     }
 
     /// Get channels by counterparty node ID

@@ -128,6 +128,9 @@ impl NodeClient {
             announce_channel,
             ..Default::default()
         };
+        
+        info!("OpenChannelRequest: capacity={} sats, push_to_counterparty_msat={:?}", 
+            request.channel_amount_sats, request.push_to_counterparty_msat);
 
         let response = self.client.open_channel(request).await
             .map_err(map_client_error)?;

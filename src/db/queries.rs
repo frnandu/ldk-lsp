@@ -111,8 +111,8 @@ impl<'a> ReceiveRequestQueries<'a> {
         let conn = conn.lock().await;
         conn.execute(
             r#"
-            INSERT INTO receive_requests (id, node_id, host, port, amount, fee_base, fee_ppm, fee_onchain, fee_total, fee_rate, total_invoice_amount, total_channel_capacity, is_splice, channel_id, status, payment_hash, failure_reason, created_at, updated_at)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
+            INSERT INTO receive_requests (id, node_id, host, port, amount, fee_base, fee_ppm, fee_onchain, fee_total, reserve_amount, fee_rate, total_invoice_amount, total_channel_capacity, is_splice, channel_id, status, payment_hash, user_invoice, user_payment_hash, user_invoice_paid, failure_reason, created_at, updated_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)
             "#,
             rusqlite::params![
                 &request.id,
@@ -124,6 +124,7 @@ impl<'a> ReceiveRequestQueries<'a> {
                 request.fee_ppm,
                 request.fee_onchain,
                 request.fee_total,
+                request.reserve_amount,
                 request.fee_rate,
                 request.total_invoice_amount,
                 request.total_channel_capacity,
@@ -131,6 +132,9 @@ impl<'a> ReceiveRequestQueries<'a> {
                 request.channel_id.as_deref(),
                 &request.status,
                 request.payment_hash.as_deref(),
+                request.user_invoice.as_deref(),
+                request.user_payment_hash.as_deref(),
+                request.user_invoice_paid,
                 request.failure_reason.as_deref(),
                 &request.created_at.to_rfc3339(),
                 &request.updated_at.to_rfc3339(),
@@ -148,7 +152,7 @@ impl<'a> ReceiveRequestQueries<'a> {
         let conn = self.db.conn().clone();
         let conn = conn.lock().await;
         let mut stmt = conn.prepare(
-            "SELECT id, node_id, host, port, amount, fee_base, fee_ppm, fee_onchain, fee_total, fee_rate, total_invoice_amount, total_channel_capacity, is_splice, channel_id, status, payment_hash, failure_reason, created_at, updated_at FROM receive_requests WHERE id = ?1"
+            "SELECT id, node_id, host, port, amount, fee_base, fee_ppm, fee_onchain, fee_total, reserve_amount, fee_rate, total_invoice_amount, total_channel_capacity, is_splice, channel_id, status, payment_hash, user_invoice, user_payment_hash, user_invoice_paid, failure_reason, created_at, updated_at FROM receive_requests WHERE id = ?1"
         )?;
         
         let result = stmt.query_row(rusqlite::params![id], |row| {
@@ -162,16 +166,20 @@ impl<'a> ReceiveRequestQueries<'a> {
                 fee_ppm: row.get(6)?,
                 fee_onchain: row.get(7)?,
                 fee_total: row.get(8)?,
-                fee_rate: row.get(9)?,
-                total_invoice_amount: row.get(10)?,
-                total_channel_capacity: row.get(11)?,
-                is_splice: row.get::<_, i32>(12)? != 0,
-                channel_id: row.get(13)?,
-                status: row.get(14)?,
-                payment_hash: row.get(15)?,
-                failure_reason: row.get(16)?,
-                created_at: row.get(17)?,
-                updated_at: row.get(18)?,
+                reserve_amount: row.get(9)?,
+                fee_rate: row.get(10)?,
+                total_invoice_amount: row.get(11)?,
+                total_channel_capacity: row.get(12)?,
+                is_splice: row.get::<_, i32>(13)? != 0,
+                channel_id: row.get(14)?,
+                status: row.get(15)?,
+                payment_hash: row.get(16)?,
+                user_invoice: row.get(17)?,
+                user_payment_hash: row.get(18)?,
+                user_invoice_paid: row.get::<_, i32>(19)? != 0,
+                failure_reason: row.get(20)?,
+                created_at: row.get(21)?,
+                updated_at: row.get(22)?,
             })
         }).optional()?;
 
@@ -183,9 +191,9 @@ impl<'a> ReceiveRequestQueries<'a> {
         let conn = self.db.conn().clone();
         let conn = conn.lock().await;
         let mut stmt = conn.prepare(
-            "SELECT id, node_id, host, port, amount, fee_base, fee_ppm, fee_onchain, fee_total, fee_rate, total_invoice_amount, total_channel_capacity, is_splice, channel_id, status, payment_hash, failure_reason, created_at, updated_at FROM receive_requests WHERE payment_hash = ?1"
+            "SELECT id, node_id, host, port, amount, fee_base, fee_ppm, fee_onchain, fee_total, reserve_amount, fee_rate, total_invoice_amount, total_channel_capacity, is_splice, channel_id, status, payment_hash, user_invoice, user_payment_hash, user_invoice_paid, failure_reason, created_at, updated_at FROM receive_requests WHERE payment_hash = ?1"
         )?;
-        
+
         let result = stmt.query_row(rusqlite::params![payment_hash], |row| {
             Ok(crate::db::ReceiveRequestModel {
                 id: row.get(0)?,
@@ -197,16 +205,20 @@ impl<'a> ReceiveRequestQueries<'a> {
                 fee_ppm: row.get(6)?,
                 fee_onchain: row.get(7)?,
                 fee_total: row.get(8)?,
-                fee_rate: row.get(9)?,
-                total_invoice_amount: row.get(10)?,
-                total_channel_capacity: row.get(11)?,
-                is_splice: row.get::<_, i32>(12)? != 0,
-                channel_id: row.get(13)?,
-                status: row.get(14)?,
-                payment_hash: row.get(15)?,
-                failure_reason: row.get(16)?,
-                created_at: row.get(17)?,
-                updated_at: row.get(18)?,
+                reserve_amount: row.get(9)?,
+                fee_rate: row.get(10)?,
+                total_invoice_amount: row.get(11)?,
+                total_channel_capacity: row.get(12)?,
+                is_splice: row.get::<_, i32>(13)? != 0,
+                channel_id: row.get(14)?,
+                status: row.get(15)?,
+                payment_hash: row.get(16)?,
+                user_invoice: row.get(17)?,
+                user_payment_hash: row.get(18)?,
+                user_invoice_paid: row.get::<_, i32>(19)? != 0,
+                failure_reason: row.get(20)?,
+                created_at: row.get(21)?,
+                updated_at: row.get(22)?,
             })
         }).optional()?;
 
@@ -214,6 +226,7 @@ impl<'a> ReceiveRequestQueries<'a> {
     }
 
     /// Update receive request status
+    /// When channel_id is None, the existing channel_id is preserved (not overwritten to NULL)
     pub async fn update_status(
         &self,
         id: &str,
@@ -222,14 +235,25 @@ impl<'a> ReceiveRequestQueries<'a> {
     ) -> Result<()> {
         let conn = self.db.conn().clone();
         let conn = conn.lock().await;
-        conn.execute(
-            r#"
-            UPDATE receive_requests
-            SET status = ?1, channel_id = ?2, updated_at = CURRENT_TIMESTAMP
-            WHERE id = ?3
-            "#,
-            rusqlite::params![status, channel_id, id],
-        )?;
+        if let Some(cid) = channel_id {
+            conn.execute(
+                r#"
+                UPDATE receive_requests
+                SET status = ?1, channel_id = ?2, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?3
+                "#,
+                rusqlite::params![status, cid, id],
+            )?;
+        } else {
+            conn.execute(
+                r#"
+                UPDATE receive_requests
+                SET status = ?1, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?2
+                "#,
+                rusqlite::params![status, id],
+            )?;
+        }
         info!(
             "DB: Updated receive request status: id={}, status={}, channel_id={:?}",
             id, status, channel_id
@@ -238,6 +262,7 @@ impl<'a> ReceiveRequestQueries<'a> {
     }
 
     /// Update receive request status with failure reason
+    /// When channel_id is None, the existing channel_id is preserved (not overwritten to NULL)
     pub async fn update_status_with_reason(
         &self,
         id: &str,
@@ -247,14 +272,25 @@ impl<'a> ReceiveRequestQueries<'a> {
     ) -> Result<()> {
         let conn = self.db.conn().clone();
         let conn = conn.lock().await;
-        conn.execute(
-            r#"
-            UPDATE receive_requests
-            SET status = ?1, channel_id = ?2, failure_reason = ?3, updated_at = CURRENT_TIMESTAMP
-            WHERE id = ?4
-            "#,
-            rusqlite::params![status, channel_id, failure_reason, id],
-        )?;
+        if let Some(cid) = channel_id {
+            conn.execute(
+                r#"
+                UPDATE receive_requests
+                SET status = ?1, channel_id = ?2, failure_reason = ?3, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?4
+                "#,
+                rusqlite::params![status, cid, failure_reason, id],
+            )?;
+        } else {
+            conn.execute(
+                r#"
+                UPDATE receive_requests
+                SET status = ?1, failure_reason = ?2, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?3
+                "#,
+                rusqlite::params![status, failure_reason, id],
+            )?;
+        }
         info!(
             "DB: Updated receive request status with reason: id={}, status={}, reason={:?}",
             id, status, failure_reason
@@ -267,9 +303,9 @@ impl<'a> ReceiveRequestQueries<'a> {
         let conn = self.db.conn().clone();
         let conn = conn.lock().await;
         let mut stmt = conn.prepare(
-            "SELECT id, node_id, host, port, amount, fee_base, fee_ppm, fee_onchain, fee_total, fee_rate, total_invoice_amount, total_channel_capacity, is_splice, channel_id, status, payment_hash, failure_reason, created_at, updated_at FROM receive_requests WHERE status = ?1 ORDER BY created_at DESC"
+            "SELECT id, node_id, host, port, amount, fee_base, fee_ppm, fee_onchain, fee_total, reserve_amount, fee_rate, total_invoice_amount, total_channel_capacity, is_splice, channel_id, status, payment_hash, user_invoice, user_payment_hash, user_invoice_paid, failure_reason, created_at, updated_at FROM receive_requests WHERE status = ?1 ORDER BY created_at DESC"
         )?;
-        
+
         let results = stmt.query_map(rusqlite::params![status], |row| {
             Ok(crate::db::ReceiveRequestModel {
                 id: row.get(0)?,
@@ -281,16 +317,20 @@ impl<'a> ReceiveRequestQueries<'a> {
                 fee_ppm: row.get(6)?,
                 fee_onchain: row.get(7)?,
                 fee_total: row.get(8)?,
-                fee_rate: row.get(9)?,
-                total_invoice_amount: row.get(10)?,
-                total_channel_capacity: row.get(11)?,
-                is_splice: row.get::<_, i32>(12)? != 0,
-                channel_id: row.get(13)?,
-                status: row.get(14)?,
-                payment_hash: row.get(15)?,
-                failure_reason: row.get(16)?,
-                created_at: row.get(17)?,
-                updated_at: row.get(18)?,
+                reserve_amount: row.get(9)?,
+                fee_rate: row.get(10)?,
+                total_invoice_amount: row.get(11)?,
+                total_channel_capacity: row.get(12)?,
+                is_splice: row.get::<_, i32>(13)? != 0,
+                channel_id: row.get(14)?,
+                status: row.get(15)?,
+                payment_hash: row.get(16)?,
+                user_invoice: row.get(17)?,
+                user_payment_hash: row.get(18)?,
+                user_invoice_paid: row.get::<_, i32>(19)? != 0,
+                failure_reason: row.get(20)?,
+                created_at: row.get(21)?,
+                updated_at: row.get(22)?,
             })
         })?;
 
@@ -323,9 +363,9 @@ impl<'a> ReceiveRequestQueries<'a> {
         let conn = self.db.conn().clone();
         let conn = conn.lock().await;
         let mut stmt = conn.prepare(
-            "SELECT id, node_id, host, port, amount, fee_base, fee_ppm, fee_onchain, fee_total, fee_rate, total_invoice_amount, total_channel_capacity, is_splice, channel_id, status, payment_hash, failure_reason, created_at, updated_at FROM receive_requests WHERE channel_id = ?1 AND status = ?2 ORDER BY created_at DESC"
+            "SELECT id, node_id, host, port, amount, fee_base, fee_ppm, fee_onchain, fee_total, reserve_amount, fee_rate, total_invoice_amount, total_channel_capacity, is_splice, channel_id, status, payment_hash, user_invoice, user_payment_hash, user_invoice_paid, failure_reason, created_at, updated_at FROM receive_requests WHERE channel_id = ?1 AND status = ?2 ORDER BY created_at DESC"
         )?;
-        
+
         let results = stmt.query_map(rusqlite::params![channel_id, status], |row| {
             Ok(crate::db::ReceiveRequestModel {
                 id: row.get(0)?,
@@ -337,16 +377,20 @@ impl<'a> ReceiveRequestQueries<'a> {
                 fee_ppm: row.get(6)?,
                 fee_onchain: row.get(7)?,
                 fee_total: row.get(8)?,
-                fee_rate: row.get(9)?,
-                total_invoice_amount: row.get(10)?,
-                total_channel_capacity: row.get(11)?,
-                is_splice: row.get::<_, i32>(12)? != 0,
-                channel_id: row.get(13)?,
-                status: row.get(14)?,
-                payment_hash: row.get(15)?,
-                failure_reason: row.get(16)?,
-                created_at: row.get(17)?,
-                updated_at: row.get(18)?,
+                reserve_amount: row.get(9)?,
+                fee_rate: row.get(10)?,
+                total_invoice_amount: row.get(11)?,
+                total_channel_capacity: row.get(12)?,
+                is_splice: row.get::<_, i32>(13)? != 0,
+                channel_id: row.get(14)?,
+                status: row.get(15)?,
+                payment_hash: row.get(16)?,
+                user_invoice: row.get(17)?,
+                user_payment_hash: row.get(18)?,
+                user_invoice_paid: row.get::<_, i32>(19)? != 0,
+                failure_reason: row.get(20)?,
+                created_at: row.get(21)?,
+                updated_at: row.get(22)?,
             })
         })?;
 

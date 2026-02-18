@@ -226,9 +226,9 @@ impl RabbitMqConsumer {
                                 receive_req.id
                             );
 
-                            // Update status to payment_received
+                            // Update status to payment_received - preserve existing channel_id
                             receive_queries
-                                .update_status(&receive_req.id, "payment_received", None)
+                                .update_status(&receive_req.id, "payment_received", receive_req.channel_id.as_deref())
                                 .await?;
 
                             if receive_req.is_splice {
@@ -258,15 +258,15 @@ impl RabbitMqConsumer {
                                     match splice_result {
                                         Ok(()) => {
                                             info!("Splice-in initiated for receive request {}", receive_req.id);
-                                            // Update status to splice_initiated
+                                            // Update status to splice_initiated - store user_channel_id (short version) for RabbitMQ lookup
                                             receive_queries
-                                                .update_status(&receive_req.id, "splice_initiated", Some(&channel.id.0))
+                                                .update_status(&receive_req.id, "splice_initiated", Some(&channel.user_channel_id))
                                                 .await?;
                                         }
                                         Err(e) => {
                                             error!("Failed to initiate splice-in: {}", e);
                                             receive_queries
-                                                .update_status_with_reason(&receive_req.id, "failed", Some(&channel.id.0), Some(&format!("Splice failed: {}", e)))
+                                                .update_status_with_reason(&receive_req.id, "failed", Some(&channel.user_channel_id), Some(&format!("Splice failed: {}", e)))
                                                 .await?;
                                         }
                                     }
@@ -281,8 +281,13 @@ impl RabbitMqConsumer {
                                 let address = format!("{}:{}", receive_req.host, receive_req.port);
                                 // Use total channel capacity from request (includes inbound buffer)
                                 let channel_capacity = receive_req.total_channel_capacity as u64;
-                                info!("Opening channel with {} sats capacity (requested: {} + buffer: {})", 
-                                    channel_capacity, receive_req.amount, channel_capacity - (receive_req.amount as u64));
+                                // Push only the reserve amount to ensure user has initial balance
+                                // The original amount will be paid via the user's invoice when channel is ready
+                                let reserve_msat = receive_req.reserve_amount as u64 * 1000;
+                                info!("Opening channel with {} sats capacity (requested: {} + reserve: {} + buffer: {}), push_msat (reserve only): {}", 
+                                    channel_capacity, receive_req.amount, receive_req.reserve_amount,
+                                    channel_capacity - (receive_req.amount as u64) - (receive_req.reserve_amount as u64),
+                                    reserve_msat);
                                 
                                 let channel_open_result = async {
                                     let node = node.read().await;
@@ -290,8 +295,8 @@ impl RabbitMqConsumer {
                                         &receive_req.node_id,
                                         &address,
                                         channel_capacity,
-                                        0,
-                                        false, // Private channel
+                                        reserve_msat, // Push only reserve amount, original amount paid via invoice
+                                        true, // Private channel (not announced)
                                     )
                                     .await
                                 }.await;
@@ -360,23 +365,66 @@ impl RabbitMqConsumer {
                     let receive_queries = ReceiveRequestQueries::new(db);
                     let receive_queries = crate::db::ReceiveRequestQueries::new(db);
                     
-                    // Find receive requests by channel_id that are in channel_opening or splice_initiated status
-                    match receive_queries.get_by_channel_id_and_status(&channel.channel_id, "channel_opening").await {
+                    // Find receive requests by user_channel_id that are in channel_opening or splice_initiated status
+                    debug!("Looking for receive requests with user_channel_id={} and status=channel_opening", channel.user_channel_id);
+                    match receive_queries.get_by_channel_id_and_status(&channel.user_channel_id, "channel_opening").await {
                         Ok(receive_requests) => {
+                            info!("Found {} receive requests with user_channel_id={} and status=channel_opening", receive_requests.len(), channel.user_channel_id);
                             for receive_req in receive_requests {
                                 match state {
                                     1 => { // READY = 1
+                                        // Keep the user_channel_id (short version) already stored, don't update to long channel_id
                                         receive_queries
-                                            .update_status(&receive_req.id, "completed", Some(&channel.channel_id))
+                                            .update_status(&receive_req.id, "completed", receive_req.channel_id.as_deref())
                                             .await?;
                                         info!(
-                                            "Channel ready for receive request {}: channel_id={}",
-                                            receive_req.id, channel.channel_id
+                                            "Channel ready for receive request {}: user_channel_id={}",
+                                            receive_req.id, channel.user_channel_id
                                         );
+                                        
+                                        // Pay the user's invoice to deliver funds
+                                        // This is consistent for both new channels and splices
+                                        if let Some(ref user_invoice) = receive_req.user_invoice {
+                                            info!("Paying user invoice for receive request {}: invoice={}", receive_req.id, user_invoice);
+                                            
+                                            // Wait a moment for the channel to be fully ready
+                                            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                                            
+                                            // Retry up to 3 times with exponential backoff
+                                            let mut retries = 3;
+                                            let mut last_error = None;
+                                            
+                                            while retries > 0 {
+                                                let pay_result = async {
+                                                    let node = node.read().await;
+                                                    node.pay_invoice(user_invoice).await
+                                                }.await;
+                                                
+                                                match pay_result {
+                                                    Ok(payment_id) => {
+                                                        info!("User invoice payment initiated: receive_id={}, payment_id={}", receive_req.id, payment_id);
+                                                        last_error = None;
+                                                        break;
+                                                    }
+                                                    Err(e) => {
+                                                        last_error = Some(e.to_string());
+                                                        retries -= 1;
+                                                        if retries > 0 {
+                                                            warn!("Failed to pay user invoice, retrying... attempts_left={}", retries);
+                                                            tokio::time::sleep(tokio::time::Duration::from_secs(2 * (3 - retries) as u64)).await;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            
+                                            if let Some(e) = last_error {
+                                                error!("Failed to pay user invoice for receive request {} after retries: {}", receive_req.id, e);
+                                            }
+                                        }
                                     }
                                     2 => { // CLOSED = 2
                                         receive_queries
-                                            .update_status_with_reason(&receive_req.id, "failed", Some(&channel.channel_id), Some("Channel closed"))
+                                            .update_status_with_reason(&receive_req.id, "failed", None, Some("Channel closed"))
                                             .await?;
                                         error!(
                                             "Channel {} closed for receive request {}",
@@ -395,8 +443,10 @@ impl RabbitMqConsumer {
                     }
                     
                     // Also check splice_initiated receive requests
-                    match receive_queries.get_by_channel_id_and_status(&channel.channel_id, "splice_initiated").await {
+                    debug!("Looking for receive requests with user_channel_id={} and status=splice_initiated", channel.user_channel_id);
+                    match receive_queries.get_by_channel_id_and_status(&channel.user_channel_id, "splice_initiated").await {
                         Ok(receive_requests) => {
+                            info!("Found {} receive requests with user_channel_id={} and status=splice_initiated", receive_requests.len(), channel.user_channel_id);
                             for receive_req in receive_requests {
                                 match state {
                                     1 => { // READY = 1
@@ -406,30 +456,70 @@ impl RabbitMqConsumer {
                                         let capacity_increased = new_capacity >= expected_capacity.saturating_sub(expected_capacity / 100);
                                         
                                         if capacity_increased {
+                                            // Keep the user_channel_id (short version) already stored, don't update to long channel_id
                                             receive_queries
-                                                .update_status(&receive_req.id, "completed", Some(&channel.channel_id))
+                                                .update_status(&receive_req.id, "completed", None)
                                                 .await?;
                                             info!(
-                                                "Splice completed for receive request {}: channel_id={}, new_capacity={}",
-                                                receive_req.id, channel.channel_id, new_capacity
+                                                "Splice completed for receive request {}: user_channel_id={}, new_capacity={}",
+                                                receive_req.id, channel.user_channel_id, new_capacity
                                             );
+                                            
+                                            // Pay the user's invoice to deliver the funds
+                                            if let Some(ref user_invoice) = receive_req.user_invoice {
+                                                info!("Paying user invoice for receive request {}: invoice={}", receive_req.id, user_invoice);
+                                                
+                                                // Wait a moment for the channel to be fully ready
+                                                tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                                                
+                                                // Retry up to 3 times with exponential backoff
+                                                let mut retries = 3;
+                                                let mut last_error = None;
+                                                
+                                                while retries > 0 {
+                                                    let pay_result = async {
+                                                        let node = node.read().await;
+                                                        node.pay_invoice(user_invoice).await
+                                                    }.await;
+                                                    
+                                                    match pay_result {
+                                                        Ok(payment_id) => {
+                                                            info!("User invoice payment initiated: receive_id={}, payment_id={}", receive_req.id, payment_id);
+                                                            last_error = None;
+                                                            break;
+                                                        }
+                                                        Err(e) => {
+                                                            last_error = Some(e.to_string());
+                                                            retries -= 1;
+                                                            if retries > 0 {
+                                                                warn!("Failed to pay user invoice, retrying... attempts_left={}", retries);
+                                                                tokio::time::sleep(tokio::time::Duration::from_secs(2 * (3 - retries) as u64)).await;
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                
+                                                if let Some(e) = last_error {
+                                                    error!("Failed to pay user invoice for receive request {} after retries: {}", receive_req.id, e);
+                                                }
+                                            }
                                         } else {
                                             receive_queries
-                                                .update_status(&receive_req.id, "splice_verification_failed", Some(&channel.channel_id))
+                                                .update_status(&receive_req.id, "splice_verification_failed", Some(&channel.user_channel_id))
                                                 .await?;
                                             warn!(
-                                                "Splice verification failed for receive request {}: channel_id={}, new_capacity={}, expected={}",
-                                                receive_req.id, channel.channel_id, new_capacity, expected_capacity
+                                                "Splice verification failed for receive request {}: user_channel_id={}, new_capacity={}, expected={}",
+                                                receive_req.id, channel.user_channel_id, new_capacity, expected_capacity
                                             );
                                         }
                                     }
                                     2 => { // CLOSED = 2
                                         receive_queries
-                                            .update_status_with_reason(&receive_req.id, "failed", Some(&channel.channel_id), Some("Channel closed"))
+                                            .update_status_with_reason(&receive_req.id, "failed", Some(&channel.user_channel_id), Some("Channel closed"))
                                             .await?;
                                         error!(
                                             "Channel {} closed during splice for receive request {}",
-                                            channel.channel_id, receive_req.id
+                                            channel.user_channel_id, receive_req.id
                                         );
                                     }
                                     _ => {

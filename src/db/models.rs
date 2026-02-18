@@ -44,6 +44,8 @@ pub struct ReceiveRequestModel {
     pub fee_onchain: i64,
     /// Total fee (base + ppm + onchain)
     pub fee_total: i64,
+    /// Channel reserve amount (satoshis, for new channels only)
+    pub reserve_amount: i64,
     /// Fee rate used for onchain calculation (sat/vbyte)
     pub fee_rate: i64,
     /// Total amount on invoice (amount + fee_total)
@@ -58,6 +60,13 @@ pub struct ReceiveRequestModel {
     pub status: String,
     /// Payment hash for invoice
     pub payment_hash: Option<String>,
+    /// BOLT11 invoice provided by user to receive the amount
+    /// LSP will pay this invoice after successful channel open/splice
+    pub user_invoice: Option<String>,
+    /// Payment hash of the user's invoice (for tracking)
+    pub user_payment_hash: Option<String>,
+    /// Whether the user's invoice has been paid
+    pub user_invoice_paid: bool,
     /// Failure reason (if failed)
     pub failure_reason: Option<String>,
     /// Creation time

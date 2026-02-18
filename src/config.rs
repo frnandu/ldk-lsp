@@ -237,6 +237,13 @@ pub struct LspConfig {
     #[serde(default = "default_jit_inbound_buffer")]
     pub jit_inbound_buffer: u64,
 
+    /// Channel reserve amount in satoshis
+    /// This is the amount that must be held in reserve and cannot be spent.
+    /// For small channels, this needs to be added to the invoice so the user
+    /// receives their requested amount after the reserve is accounted for.
+    #[serde(default = "default_channel_reserve")]
+    pub channel_reserve: u64,
+
     /// Fee estimator API URL (optional, defaults to mempool.space)
     /// Set to empty string to disable dynamic fees and use static estimates
     #[serde(default = "default_fee_api_url")]
@@ -263,6 +270,7 @@ impl Default for LspConfig {
             jit_receive_fee_ppm: default_jit_receive_fee_ppm(),
             jit_min_receive_amount: default_jit_min_receive_amount(),
             jit_inbound_buffer: default_jit_inbound_buffer(),
+            channel_reserve: default_channel_reserve(),
             fee_api_url: default_fee_api_url(),
             fee_confirmation_target: default_fee_confirmation_target(),
         }
@@ -311,6 +319,10 @@ fn default_jit_min_receive_amount() -> u64 {
 
 fn default_jit_inbound_buffer() -> u64 {
     50_000 // 50k sats extra inbound liquidity by default
+}
+
+fn default_channel_reserve() -> u64 {
+    1_000 // 1k sats minimum reserve (increases with channel size per LN spec)
 }
 
 fn default_fee_api_url() -> String {

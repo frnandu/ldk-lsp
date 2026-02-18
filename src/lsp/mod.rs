@@ -536,12 +536,14 @@ impl LspService {
 
     /// Request a JIT receive quote
     /// Creates an invoice for the user to pay, which will trigger either a splice or new channel
+    /// After successful channel open/splice, pays the user's invoice to deliver the funds
     pub async fn request_receive_quote(
         &self,
         node_id: &str,
         host: &str,
         port: u16,
         amount: u64,
+        user_invoice: &str,
         node: Arc<RwLock<LspNode>>,
     ) -> LspResult<(ReceiveQuote, String)> {
         info!(
@@ -562,9 +564,10 @@ impl LspService {
         let (is_splice, channel_id) = if let Some(channel) = existing_channels.first() {
             info!(
                 "Found existing channel {} with {}, will splice",
-                channel.id.0, node_id
+                channel.user_channel_id, node_id
             );
-            (true, Some(channel.id.clone()))
+            // Store user_channel_id (short version) for RabbitMQ event matching
+            (true, Some(ChannelId(channel.user_channel_id.clone())))
         } else {
             info!("No existing channel with {}, will open new channel", node_id);
             (false, None)
@@ -587,7 +590,12 @@ impl LspService {
         // Calculate fees
         let (base_fee, ppm_fee, service_fee) = self.config.calculate_jit_service_fee(amount);
         let fee_total = service_fee.saturating_add(onchain_fee);
-        let total_invoice_amount = amount.saturating_add(fee_total);
+        
+        // Include channel reserve only for new channels (not splices)
+        // For new channels, this ensures user gets their full requested amount after reserve is locked
+        // For splices, reserve is already covered by the existing channel
+        let reserve_amount = if is_splice { 0 } else { self.config.lsp.channel_reserve };
+        let total_invoice_amount = amount.saturating_add(fee_total).saturating_add(reserve_amount);
 
         // Generate a request ID
         let receive_id = uuid::Uuid::new_v4().to_string();
@@ -608,8 +616,18 @@ impl LspService {
         // Extract payment hash from invoice
         let payment_hash = Self::extract_payment_hash_from_invoice(&invoice)?;
 
-        // Calculate total channel capacity (amount + inbound buffer)
-        let total_channel_capacity = amount.saturating_add(self.config.lsp.jit_inbound_buffer);
+        // Extract payment hash from user's invoice (for tracking)
+        let user_payment_hash = Self::extract_payment_hash_from_invoice(user_invoice)
+            .map_err(|e| LspError::Validation(format!("Invalid user invoice: {}", e)))?;
+
+        // Calculate total channel capacity
+        // For new channels: amount + reserve + inbound buffer
+        // For splices: amount + inbound buffer (reserve already exists)
+        let total_channel_capacity = if is_splice {
+            amount.saturating_add(self.config.lsp.jit_inbound_buffer)
+        } else {
+            amount.saturating_add(reserve_amount).saturating_add(self.config.lsp.jit_inbound_buffer)
+        };
 
         // Save the request to the database
         let request_model = crate::db::ReceiveRequestModel {
@@ -622,6 +640,7 @@ impl LspService {
             fee_ppm: ppm_fee as i64,
             fee_onchain: onchain_fee as i64,
             fee_total: fee_total as i64,
+            reserve_amount: reserve_amount as i64,
             fee_rate: fee_rate as i64,
             total_invoice_amount: total_invoice_amount as i64,
             total_channel_capacity: total_channel_capacity as i64,
@@ -629,6 +648,9 @@ impl LspService {
             channel_id: channel_id.as_ref().map(|c| c.0.clone()),
             status: "pending_payment".to_string(),
             payment_hash: Some(payment_hash.clone()),
+            user_invoice: Some(user_invoice.to_string()),
+            user_payment_hash: Some(user_payment_hash),
+            user_invoice_paid: false,
             failure_reason: None,
             created_at: now,
             updated_at: now,
@@ -641,8 +663,8 @@ impl LspService {
             .map_err(|e| LspError::Database(format!("Failed to save receive request: {}", e)))?;
 
         info!(
-            "Receive quote generated and saved to DB: receive_id={}, amount={}, is_splice={}, total={}, payment_hash={}",
-            receive_id, amount, is_splice, total_invoice_amount, payment_hash
+            "Receive quote generated: receive_id={}, amount={}, reserve={}, fees={}, total={}, is_splice={}, payment_hash={}",
+            receive_id, amount, reserve_amount, fee_total, total_invoice_amount, is_splice, payment_hash
         );
 
         let quote = ReceiveQuote {
@@ -651,7 +673,8 @@ impl LspService {
             fee_base: base_fee,
             fee_ppm: ppm_fee,
             fee_onchain: onchain_fee,
-            fee_total,
+            reserve_amount,
+            fee_total: fee_total.saturating_add(reserve_amount),
             fee_rate,
             total_invoice_amount,
             is_splice,
@@ -1058,14 +1081,14 @@ impl LspService {
         // Check current status
         match request.status.as_str() {
             "completed" | "channel_opened" | "splice_completed" => {
-                if let Some(channel_id) = request.channel_id {
-                    return Ok(ReceiveRequestStatus::Completed(ChannelId(channel_id)));
-                }
+                // Return completed even if channel_id is missing (it may have been cleared)
+                let cid = request.channel_id.unwrap_or_default();
+                return Ok(ReceiveRequestStatus::Completed(ChannelId(cid)));
             }
             "channel_opening" => return Ok(ReceiveRequestStatus::ChannelOpening),
-            "splice_initiated" => return Ok(ReceiveRequestStatus::SpliceInitiated),
+            "splice_initiated" | "payment_received" => return Ok(ReceiveRequestStatus::SpliceInitiated),
             "expired" => return Ok(ReceiveRequestStatus::Expired),
-            "failed" => {
+            "failed" | "channel_open_failed" | "splice_verification_failed" => {
                 return Ok(ReceiveRequestStatus::Failed(
                     request.failure_reason.unwrap_or_default(),
                 ))
@@ -1166,8 +1189,13 @@ impl LspService {
                             let address = format!("{}:{}", request.host, request.port);
                             // Use total channel capacity from request (includes inbound buffer)
                             let channel_capacity = request.total_channel_capacity as u64;
-                            info!("Opening channel with {} sats capacity (requested: {} + buffer: {})", 
-                                channel_capacity, request.amount, channel_capacity - (request.amount as u64));
+                            // Push only the reserve amount to ensure user has initial balance
+                            // The original amount will be paid via the user's invoice when channel is ready
+                            let reserve_msat = request.reserve_amount as u64 * 1000;
+                            info!("Opening channel with {} sats capacity (requested: {} + reserve: {} + buffer: {}), push_msat (reserve only): {}", 
+                                channel_capacity, request.amount, request.reserve_amount, 
+                                channel_capacity - (request.amount as u64) - (request.reserve_amount as u64),
+                                reserve_msat);
                             
                             let channel_id = {
                                 let node = node.read().await;
@@ -1175,7 +1203,7 @@ impl LspService {
                                     &request.node_id,
                                     &address,
                                     channel_capacity,
-                                    0,     // No push MSAT
+                                    reserve_msat, // Push only reserve amount, original amount paid via invoice
                                     false, // Private channel (not announced)
                                 )
                                 .await?
@@ -1231,6 +1259,50 @@ impl LspService {
         }
 
         Ok(ReceiveRequestStatus::PendingPayment)
+    }
+
+    /// Pay the user's invoice to deliver the funds after successful channel open/splice
+    /// This is called from the RabbitMQ handler when the channel becomes ready
+    pub async fn pay_user_invoice(
+        &self,
+        receive_id: &str,
+        node: Arc<RwLock<LspNode>>,
+    ) -> LspResult<()> {
+        let queries = crate::db::ReceiveRequestQueries::new(&self.db);
+        
+        // Get the request
+        let request = queries
+            .get_by_id(receive_id)
+            .await
+            .map_err(|e| LspError::Database(format!("Failed to get receive request: {}", e)))?
+            .ok_or_else(|| LspError::Validation(format!("Receive request not found: {}", receive_id)))?;
+        
+        // Check if we have a user invoice to pay
+        if let Some(ref user_invoice) = request.user_invoice {
+            if !request.user_invoice_paid {
+                info!("Paying user invoice for receive request {}: amount={} sats", receive_id, request.amount);
+                
+                // Pay the user's invoice
+                let payment_result = async {
+                    let node = node.read().await;
+                    node.pay_invoice(user_invoice).await
+                }.await;
+                
+                match payment_result {
+                    Ok(payment_id) => {
+                        info!("User invoice payment initiated: receive_id={}, payment_id={}", receive_id, payment_id);
+                        // The payment is async - we don't wait for it to complete here
+                        // The user can check their wallet for the incoming payment
+                    }
+                    Err(e) => {
+                        error!("Failed to pay user invoice for receive request {}: {}", receive_id, e);
+                        // Don't fail the whole request - the channel is open, user just needs to retry
+                    }
+                }
+            }
+        }
+        
+        Ok(())
     }
 }
 
@@ -1327,7 +1399,9 @@ pub struct ReceiveQuote {
     pub fee_ppm: u64,
     /// Estimated onchain fee
     pub fee_onchain: u64,
-    /// Total fee
+    /// Channel reserve amount (ensures user gets their full amount)
+    pub reserve_amount: u64,
+    /// Total fee (base + ppm + onchain + reserve)
     pub fee_total: u64,
     /// Fee rate used for onchain calculation (sat/vbyte)
     pub fee_rate: u64,
@@ -1403,4 +1477,20 @@ pub enum ReceiveRequestStatus {
     Expired,
     /// Request failed
     Failed(String),
+}
+
+impl ReceiveRequestStatus {
+    /// Get a clean string representation of the status
+    pub fn as_str(&self) -> &str {
+        match self {
+            ReceiveRequestStatus::PendingPayment => "pending_payment",
+            ReceiveRequestStatus::ChannelOpening => "channel_opening",
+            ReceiveRequestStatus::ChannelOpened(_) => "channel_opened",
+            ReceiveRequestStatus::SpliceInitiated => "splice_initiated",
+            ReceiveRequestStatus::SpliceCompleted(_) => "splice_completed",
+            ReceiveRequestStatus::Completed(_) => "completed",
+            ReceiveRequestStatus::Expired => "expired",
+            ReceiveRequestStatus::Failed(_) => "failed",
+        }
+    }
 }

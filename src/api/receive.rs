@@ -23,6 +23,9 @@ pub struct ReceiveQuoteRequest {
     pub port: u16,
     /// Amount the user wants to receive (satoshis)
     pub amount: u64,
+    /// BOLT11 invoice for the amount the user wants to receive
+    /// After successful splice/channel open, LSP will pay this invoice
+    pub invoice: String,
 }
 
 /// Fee breakdown in the response
@@ -34,7 +37,10 @@ pub struct FeeBreakdown {
     pub ppm: u64,
     /// Estimated onchain fee (satoshis)
     pub onchain: u64,
-    /// Total fee (base + ppm + onchain)
+    /// Channel reserve amount (satoshis)
+    /// This ensures the user receives their full requested amount after the reserve is locked
+    pub reserve: u64,
+    /// Total fee (base + ppm + onchain + reserve)
     pub total: u64,
     /// Fee rate used for onchain calculation (sat/vbyte)
     pub fee_rate: u64,
@@ -85,6 +91,7 @@ pub async fn request_receive_quote(
             &req.host,
             req.port,
             req.amount,
+            &req.invoice,
             state.app.node.clone(),
         )
         .await
@@ -102,6 +109,7 @@ pub async fn request_receive_quote(
                     base: quote.fee_base,
                     ppm: quote.fee_ppm,
                     onchain: quote.fee_onchain,
+                    reserve: quote.reserve_amount,
                     total: quote.fee_total,
                     fee_rate: quote.fee_rate,
                 },
@@ -166,7 +174,7 @@ pub async fn get_receive_request(
                 Ok(Some(req)) => {
                     let response = ReceiveRequestResponse {
                         receive_id: req.id,
-                        status: format!("{:?}", current_status),
+                        status: current_status.as_str().to_string(),
                         amount: req.amount,
                         is_splice: req.is_splice,
                         channel_id: match current_status {
@@ -178,6 +186,7 @@ pub async fn get_receive_request(
                             base: req.fee_base,
                             ppm: req.fee_ppm,
                             onchain: req.fee_onchain,
+                            reserve: 0, // Reserve not stored in DB for existing requests
                             total: req.fee_total,
                             fee_rate: req.fee_rate,
                         },

@@ -84,7 +84,7 @@ impl Database {
 
         if table_exists {
             // Check if required columns exist
-            let required_columns = ["total_channel_capacity", "fee_rate"];
+            let required_columns = ["total_channel_capacity", "fee_rate", "user_invoice", "reserve_amount"];
             for col in &required_columns {
                 let column_exists: bool = conn.query_row(
                     &format!("SELECT COUNT(*) FROM pragma_table_info('receive_requests') WHERE name='{}'", col),
@@ -113,6 +113,7 @@ impl Database {
                 fee_ppm INTEGER NOT NULL,
                 fee_onchain INTEGER NOT NULL,
                 fee_total INTEGER NOT NULL,
+                reserve_amount INTEGER NOT NULL DEFAULT 0,
                 fee_rate INTEGER NOT NULL,
                 total_invoice_amount INTEGER NOT NULL,
                 total_channel_capacity INTEGER NOT NULL,
@@ -120,6 +121,9 @@ impl Database {
                 channel_id TEXT,
                 status TEXT NOT NULL,
                 payment_hash TEXT,
+                user_invoice TEXT,
+                user_payment_hash TEXT,
+                user_invoice_paid BOOLEAN NOT NULL DEFAULT 0,
                 failure_reason TEXT,
                 created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
