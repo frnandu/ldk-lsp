@@ -229,21 +229,6 @@ Response:
 - `Completed`: Channel/splice ready for use
 - `Failed`: Something went wrong (see `failure_reason`)
 
-### Request Splice Quote (Legacy)
-
-For manual splicing (not through JIT receive flow):
-
-```bash
-POST /v1/splice/quote
-Content-Type: application/json
-
-{
-  "channel_id": "...",
-  "additional_capacity": 500000
-}
-```
-
-## Development
 
 ### Running Tests
 
